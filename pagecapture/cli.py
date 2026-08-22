@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     rm.set_defaults(func=cmd_rm)
 
-    rerun = sub.add_parser("rerun", help="Queue job(s) to run again")
+    rerun = sub.add_parser("rerun", help="Queue a new job with the same URLs and options")
     rerun.add_argument("job_ids", nargs="+")
     rerun.set_defaults(func=cmd_rerun)
 
@@ -202,7 +202,10 @@ def cmd_rerun(args: argparse.Namespace) -> None:
         resp = client.post("/api/jobs/rerun", json={"ids": args.job_ids})
         _raise(resp)
         data = resp.json()
-    print(f"reran {len(data.get('reran') or [])}")
+    created = data.get("created") or []
+    print(f"queued {len(created)} new job(s)")
+    for job_id in created:
+        print(job_id)
     for row in data.get("skipped") or []:
         print(f"  skipped {row['id']}: {row['reason']}")
 

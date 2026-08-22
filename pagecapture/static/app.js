@@ -256,12 +256,10 @@ async function rerunJobs(ids) {
       method: "POST",
       body: JSON.stringify({ ids }),
     });
-    if (result.skipped && result.skipped.length) {
-      const running = result.skipped.filter((row) => row.reason === "running").length;
-      if (running) {
-        alert(`${running} running job(s) skipped. Wait until they finish, then run again.`);
-      }
-    }
+    const created = result.created || [];
+    checkedIds.clear();
+    for (const id of created) checkedIds.add(id);
+    if (created.length) selectedId = created[0];
     refresh();
   } catch (err) {
     countsEl.textContent = err.message;

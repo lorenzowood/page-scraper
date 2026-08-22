@@ -294,7 +294,12 @@ async def rerun_jobs(
     x_api_key: str | None = Header(default=None),
 ):
     _check_token(authorization, x_api_key)
-    return await db.rerun_jobs(body.ids)
+    result = await db.clone_jobs(body.ids)
+    return {
+        "created": [job["id"] for job in result["created"]],
+        "jobs": [_with_eta(job) for job in result["created"]],
+        "skipped": result["skipped"],
+    }
 
 
 @app.post("/api/jobs/{job_id}/rerun")
@@ -304,15 +309,14 @@ async def rerun_job(
     x_api_key: str | None = Header(default=None),
 ):
     _check_token(authorization, x_api_key)
-    result = await db.rerun_jobs([job_id])
-    if not result["reran"] and result["skipped"] and result["skipped"][0]["reason"] == "not found":
+    result = await db.clone_jobs([job_id])
+    if not result["created"] and result["skipped"] and result["skipped"][0]["reason"] == "not found":
         raise HTTPException(status_code=404, detail="job not found")
-    if not result["reran"]:
+    if not result["created"]:
         reason = result["skipped"][0]["reason"] if result["skipped"] else "skipped"
         raise HTTPException(status_code=409, detail=f"cannot rerun: {reason}")
-    job = await db.get_job(job_id)
-    payload = _with_eta(job) if job else {"id": job_id}
-    payload["rerun"] = result
+    payload = _with_eta(result["created"][0])
+    payload["source_id"] = job_id
     return payload
 
 

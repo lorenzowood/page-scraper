@@ -180,7 +180,7 @@ docker compose exec page-scraper page-scraper add --wait https://example.com/
 `POST /api/jobs/{id}/cancel`  
 `DELETE /api/jobs/{id}?delete_files=false` — drop from the list; `delete_files=true` also removes that job's PNG/DOM/video, `meta.json`, and empty folders  
 `POST /api/jobs/delete` — `{ "ids": ["…"], "delete_files": false }`  
-`POST /api/jobs/{id}/rerun` / `POST /api/jobs/rerun` — `{ "ids": ["…"] }` re-queues items (skips jobs that are still running)
+`POST /api/jobs/{id}/rerun` / `POST /api/jobs/rerun` — `{ "ids": ["…"] }` queues a **new** job with the same URLs, presets, and options. The original job and its files stay put.
 
 Presets: `desktop`, `iphone`, `no-css`, `no-js`. Job-level cookies / UA / viewport / `--no-js` overlay every preset.
 

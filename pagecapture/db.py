@@ -311,58 +311,27 @@ class Database:
         await self.conn.commit()
         return deleted
 
-    async def rerun_jobs(self, job_ids: list[str]) -> dict[str, Any]:
-        now = _now()
-        reran: list[str] = []
+    async def clone_jobs(self, job_ids: list[str]) -> dict[str, Any]:
+        created: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
         for job_id in job_ids:
             job = await self.get_job(job_id)
             if not job:
                 skipped.append({"id": job_id, "reason": "not found"})
                 continue
-            if job["status"] == "running":
-                skipped.append({"id": job_id, "reason": "running"})
+            items = await self.list_items(job_id)
+            pairs = [(item["url"], item["preset"]) for item in items]
+            if not pairs:
+                skipped.append({"id": job_id, "reason": "no items"})
                 continue
-            await self.conn.execute(
-                """
-                UPDATE items
-                SET status='queued',
-                    reason=NULL,
-                    saved=0,
-                    error=NULL,
-                    screenshot_path=NULL,
-                    dom_path=NULL,
-                    video_path=NULL,
-                    output_path=NULL,
-                    http_status=NULL,
-                    height_px=NULL,
-                    cookie_dismissed=0,
-                    height_capped=0,
-                    started_at=NULL,
-                    finished_at=NULL,
-                    duration_ms=NULL
-                WHERE job_id=?
-                """,
-                (job_id,),
+            clone = await self.create_job(
+                name=job.get("name"),
+                output_dir=job["output_dir"],
+                options=job.get("options") or {},
+                items=pairs,
             )
-            await self.conn.execute(
-                """
-                UPDATE jobs
-                SET status='queued',
-                    done=0,
-                    failed=0,
-                    partial=0,
-                    started_at=NULL,
-                    finished_at=NULL,
-                    avg_ms=NULL,
-                    updated_at=?
-                WHERE id=?
-                """,
-                (now, job_id),
-            )
-            reran.append(job_id)
-        await self.conn.commit()
-        return {"reran": reran, "skipped": skipped}
+            created.append(clone)
+        return {"created": created, "skipped": skipped}
 
     async def job_counts(self) -> dict[str, int]:
         cur = await self.conn.execute(

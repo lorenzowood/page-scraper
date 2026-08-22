@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Page Scraper</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">Page Scraper</div>
+    <nav id="filters">
+      <button data-filter="" class="active">All</button>
+      <button data-filter="running">Running</button>
+      <button data-filter="queued">Queued</button>
+      <button data-filter="completed">Completed</button>
+      <button data-filter="cancelled">Cancelled</button>
+    </nav>
+    <div class="spacer"></div>
+    <div id="counts" class="counts"></div>
+    <button id="rerun-btn" disabled>Run again</button>
+    <button id="remove-btn" disabled>Remove</button>
+    <button id="add-btn" class="primary">Add URLs</button>
+  </header>
+  <main>
+    <table>
+      <thead>
+        <tr>
+          <th class="check"><input type="checkbox" id="select-all" title="Select all"></th>
+          <th>Name</th>
+          <th>Status</th>
+          <th>Progress</th>
+          <th>ETA</th>
+          <th>Failed</th>
+          <th>Output</th>
+        </tr>
+      </thead>
+      <tbody id="jobs"></tbody>
+    </table>
+    <p id="empty" class="empty hidden">No jobs yet. Add a list of URLs to capture.</p>
+  </main>
+  <section id="detail" class="detail hidden">
+    <div class="detail-head">
+      <h2 id="detail-title"></h2>
+      <button id="rerun-detail-btn">Run again</button>
+      <button id="remove-detail-btn">Remove</button>
+      <button id="cancel-btn">Cancel remaining</button>
+      <button id="close-detail">Close</button>
+    </div>
+    <p id="detail-meta" class="muted"></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Status</th>
+          <th>Files</th>
+          <th>Video</th>
+          <th>Preset</th>
+          <th>URL</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody id="items"></tbody>
+    </table>
+  </section>
+
+  <dialog id="add-dialog">
+    <form id="add-form" method="dialog">
+      <h2>Add URLs</h2>
+      <label>Name <input name="name" placeholder="Optional job name"></label>
+      <label>URLs
+        <textarea name="urls" rows="10" placeholder="https://example.com&#10;https://another.example/" required></textarea>
+      </label>
+      <fieldset>
+        <legend>Presets</legend>
+        <label class="check"><input type="checkbox" name="preset" value="desktop" checked> desktop</label>
+        <label class="check"><input type="checkbox" name="preset" value="iphone"> iphone</label>
+        <label class="check"><input type="checkbox" name="preset" value="no-css"> no-css</label>
+        <label class="check"><input type="checkbox" name="preset" value="no-js"> no-js</label>
+      </fieldset>
+      <label>Output directory <input name="output_dir" placeholder="Leave blank for the default NAS folder"></label>
+      <details>
+        <summary>Advanced</summary>
+        <label>User-Agent <input name="user_agent"></label>
+        <label>Cookies <input name="cookies" placeholder="name=value; other=value"></label>
+        <div class="row">
+          <label>Width <input name="viewport_width" type="number" min="320"></label>
+          <label>Height <input name="viewport_height" type="number" min="240"></label>
+        </div>
+        <div class="row">
+          <label>Stable ms <input name="stable_ms" type="number"></label>
+          <label>Timeout ms <input name="timeout_ms" type="number"></label>
+        </div>
+        <label>Video seconds <input name="video_seconds" type="number" min="1" placeholder="30"></label>
+      </details>
+      <div class="actions">
+        <button type="button" id="cancel-add">Close</button>
+        <button class="primary">Queue</button>
+      </div>
+      <p id="add-error" class="error"></p>
+    </form>
+  </dialog>
+
+  <dialog id="remove-dialog">
+    <form id="remove-form">
+      <h2>Remove jobs</h2>
+      <p id="remove-copy">Are you sure you want to remove the selected jobs?</p>
+      <label class="check">
+        <input type="checkbox" id="remove-files"> Also remove content files
+      </label>
+      <div class="actions">
+        <button type="button" id="remove-cancel">Cancel</button>
+        <button type="submit" class="danger" id="remove-confirm">Remove</button>
+      </div>
+      <p id="remove-error" class="error"></p>
+    </form>
+  </dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>

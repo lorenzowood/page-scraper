@@ -333,6 +333,84 @@ class Database:
             created.append(clone)
         return {"created": created, "skipped": skipped}
 
+    async def retry_unsaved(self, job_ids: list[str]) -> dict[str, Any]:
+        now = _now()
+        retried: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        for job_id in job_ids:
+            job = await self.get_job(job_id)
+            if not job:
+                skipped.append({"id": job_id, "reason": "not found"})
+                continue
+            cur = await self.conn.execute(
+                """
+                UPDATE items
+                SET status='queued',
+                    reason=NULL,
+                    saved=0,
+                    error=NULL,
+                    screenshot_path=NULL,
+                    dom_path=NULL,
+                    video_path=NULL,
+                    output_path=NULL,
+                    http_status=NULL,
+                    height_px=NULL,
+                    cookie_dismissed=0,
+                    height_capped=0,
+                    started_at=NULL,
+                    finished_at=NULL,
+                    duration_ms=NULL
+                WHERE job_id=?
+                  AND IFNULL(saved, 0)=0
+                  AND status NOT IN ('queued', 'running')
+                """,
+                (job_id,),
+            )
+            n = cur.rowcount or 0
+            if n <= 0:
+                skipped.append({"id": job_id, "reason": "nothing to retry"})
+                continue
+            cur = await self.conn.execute(
+                """
+                SELECT
+                    SUM(status IN ('complete', 'failed')) AS done,
+                    SUM(status='failed' AND saved=1) AS partial,
+                    SUM(status='failed') AS failed,
+                    SUM(status='queued') AS queued,
+                    SUM(status='running') AS running
+                FROM items WHERE job_id=?
+                """,
+                (job_id,),
+            )
+            stats = dict(await cur.fetchone())
+            remaining = (stats["queued"] or 0) + (stats["running"] or 0)
+            if (stats["running"] or 0) > 0:
+                job_status = "running"
+            elif remaining:
+                job_status = "queued"
+            else:
+                job_status = "completed"
+            await self.conn.execute(
+                """
+                UPDATE jobs
+                SET done=?, failed=?, partial=?, status=?, updated_at=?,
+                    finished_at=CASE WHEN ?='completed' THEN finished_at ELSE NULL END
+                WHERE id=?
+                """,
+                (
+                    stats["done"] or 0,
+                    stats["failed"] or 0,
+                    stats["partial"] or 0,
+                    job_status,
+                    now,
+                    job_status,
+                    job_id,
+                ),
+            )
+            retried.append({"id": job_id, "items": n})
+        await self.conn.commit()
+        return {"retried": retried, "skipped": skipped}
+
     async def job_counts(self) -> dict[str, int]:
         cur = await self.conn.execute(
             """

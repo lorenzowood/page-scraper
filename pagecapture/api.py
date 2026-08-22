@@ -79,6 +79,9 @@ def _eta(job: dict[str, Any]) -> int | None:
 def _with_eta(job: dict[str, Any]) -> dict[str, Any]:
     job = dict(job)
     job["eta_seconds"] = _eta(job)
+    failed = int(job.get("failed") or 0)
+    partial = int(job.get("partial") or 0)
+    job["unsaved"] = max(failed - partial, 0)
     return job
 
 
@@ -317,6 +320,35 @@ async def rerun_job(
         raise HTTPException(status_code=409, detail=f"cannot rerun: {reason}")
     payload = _with_eta(result["created"][0])
     payload["source_id"] = job_id
+    return payload
+
+
+@app.post("/api/jobs/retry")
+async def retry_jobs(
+    body: JobBulkIds,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+):
+    _check_token(authorization, x_api_key)
+    return await db.retry_unsaved(body.ids)
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+):
+    _check_token(authorization, x_api_key)
+    result = await db.retry_unsaved([job_id])
+    if not result["retried"] and result["skipped"] and result["skipped"][0]["reason"] == "not found":
+        raise HTTPException(status_code=404, detail="job not found")
+    if not result["retried"]:
+        reason = result["skipped"][0]["reason"] if result["skipped"] else "skipped"
+        raise HTTPException(status_code=409, detail=f"cannot retry: {reason}")
+    job = await db.get_job(job_id)
+    payload = _with_eta(job) if job else {"id": job_id}
+    payload["retry"] = result
     return payload
 
 

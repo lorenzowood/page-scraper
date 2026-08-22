@@ -145,6 +145,7 @@ page-scraper get JOB_ID -o ./captures
 page-scraper cancel JOB_ID
 page-scraper rm JOB_ID [--files]
 page-scraper rerun JOB_ID
+page-scraper retry JOB_ID
 ```
 
 Inside the container:
@@ -180,7 +181,10 @@ docker compose exec page-scraper page-scraper add --wait https://example.com/
 `POST /api/jobs/{id}/cancel`  
 `DELETE /api/jobs/{id}?delete_files=false` — drop from the list; `delete_files=true` also removes that job's PNG/DOM/video, `meta.json`, and empty folders  
 `POST /api/jobs/delete` — `{ "ids": ["…"], "delete_files": false }`  
-`POST /api/jobs/{id}/rerun` / `POST /api/jobs/rerun` — `{ "ids": ["…"] }` queues a **new** job with the same URLs, presets, and options. The original job and its files stay put.
+`POST /api/jobs/{id}/rerun` / `POST /api/jobs/rerun` — `{ "ids": ["…"] }` queues a **new** job with the same URLs, presets, and options. The original job and its files stay put.  
+`POST /api/jobs/{id}/retry` / `POST /api/jobs/retry` — `{ "ids": ["…"] }` re-queues items in that job that never wrote files (`crash`, `load`, cancelled leftovers). Successful captures are left alone.
+
+If the page navigates after load (cookie reload, JS redirect), the worker waits for the new document and continues instead of marking the item `crash`.
 
 Presets: `desktop`, `iphone`, `no-css`, `no-js`. Job-level cookies / UA / viewport / `--no-js` overlay every preset.
 

@@ -77,6 +77,10 @@ def main(argv: list[str] | None = None) -> None:
     rerun.add_argument("job_ids", nargs="+")
     rerun.set_defaults(func=cmd_rerun)
 
+    retry = sub.add_parser("retry", help="Re-queue items in a job that did not write files")
+    retry.add_argument("job_ids", nargs="+")
+    retry.set_defaults(func=cmd_retry)
+
     wait = sub.add_parser("wait", help="Wait for a job to finish")
     wait.add_argument("job_id")
     wait.set_defaults(func=cmd_wait)
@@ -195,6 +199,17 @@ def cmd_rm(args: argparse.Namespace) -> None:
         _raise(resp)
         data = resp.json()
     print(f"removed {data.get('deleted', 0)}" + (f", files {data.get('files_removed', 0)}" if args.files else ""))
+
+
+def cmd_retry(args: argparse.Namespace) -> None:
+    with _client(args) as client:
+        resp = client.post("/api/jobs/retry", json={"ids": args.job_ids})
+        _raise(resp)
+        data = resp.json()
+    for row in data.get("retried") or []:
+        print(f"retried {row['items']} item(s) in {row['id']}")
+    for row in data.get("skipped") or []:
+        print(f"  skipped {row['id']}: {row['reason']}")
 
 
 def cmd_rerun(args: argparse.Namespace) -> None:

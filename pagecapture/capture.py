@@ -102,6 +102,56 @@ EMPTY_JS = """() => {
   return { html: html.length, text: (text || "").trim().length };
 }"""
 
+_NAV_LOSS = (
+    "execution context was destroyed",
+    "because of a navigation",
+    "frame was detached",
+    "target closed",
+    "target page, context or browser has been closed",
+)
+
+
+def _is_nav_loss(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(needle in text for needle in _NAV_LOSS)
+
+
+async def _settle(page: Page, timeout_ms: float = 5000) -> None:
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except Exception:
+        await asyncio.sleep(0.25)
+
+
+async def eval_page(page: Page, expression: str, *args, retries: int = 4):
+    last: Exception | None = None
+    for _ in range(retries):
+        try:
+            return await page.evaluate(expression, *args)
+        except Exception as exc:
+            last = exc
+            if not _is_nav_loss(exc):
+                raise
+            log.info("page navigated during evaluate; waiting for the new document")
+            await _settle(page)
+    assert last is not None
+    raise last
+
+
+async def screenshot_page(page: Page, **kwargs):
+    last: Exception | None = None
+    for _ in range(4):
+        try:
+            return await page.screenshot(**kwargs)
+        except Exception as exc:
+            last = exc
+            if not _is_nav_loss(exc):
+                raise
+            log.info("page navigated during screenshot; waiting for the new document")
+            await _settle(page)
+    assert last is not None
+    raise last
+
 
 @dataclass
 class CaptureResult:
@@ -292,7 +342,16 @@ class BrowserEngine:
                 )
                 return result
 
-            sizes = await page.evaluate(EMPTY_JS)
+            try:
+                sizes = await eval_page(page, EMPTY_JS)
+            except Exception as exc:
+                result = CaptureResult(
+                    status="failed",
+                    reason="load" if _is_nav_loss(exc) else "crash",
+                    error=str(exc),
+                    http_status=http_status,
+                )
+                return result
             if sizes["html"] < 180 and sizes["text"] < 20:
                 result = CaptureResult(
                     status="failed",
@@ -315,20 +374,25 @@ class BrowserEngine:
                     pass
 
             if not css:
-                await page.evaluate(
-                    """() => {
-                      document.querySelectorAll('style, link[rel="stylesheet"]').forEach((el) => el.remove());
-                      document.querySelectorAll('[style]').forEach((el) => el.removeAttribute('style'));
-                    }"""
-                )
+                try:
+                    await eval_page(
+                        page,
+                        """() => {
+                          document.querySelectorAll('style, link[rel="stylesheet"]').forEach((el) => el.remove());
+                          document.querySelectorAll('[style]').forEach((el) => el.removeAttribute('style'));
+                        }""",
+                    )
+                except Exception:
+                    pass
 
             try:
-                await page.evaluate(
+                await eval_page(
+                    page,
                     """() => {
                       document.querySelectorAll('img[loading="lazy"]').forEach((img) => {
                         img.loading = "eager";
                       });
-                    }"""
+                    }""",
                 )
             except Exception:
                 pass
@@ -354,7 +418,8 @@ class BrowserEngine:
                 if len(jpeg_frames) >= max_frames:
                     return
                 jpeg = await asyncio.wait_for(
-                    page.screenshot(
+                    screenshot_page(
+                        page,
                         type="jpeg",
                         quality=80,
                         full_page=True,
@@ -362,7 +427,7 @@ class BrowserEngine:
                         caret="hide",
                         scale="css",
                     ),
-                    timeout=5,
+                    timeout=20,
                 )
                 now = clock.time()
                 if t_first is None:
@@ -406,20 +471,21 @@ class BrowserEngine:
             # Banners can appear during encode (WDS waits on window.load + 500ms).
             await try_cookies()
 
-            height = int(await page.evaluate(HEIGHT_JS) or 0)
+            height = int(await eval_page(page, HEIGHT_JS) or 0)
             height_capped = height > max_height
             notes: list[str] = []
             try:
                 still_capped = await asyncio.wait_for(
                     _screenshot(page, screenshot_path, height, max_height),
-                    timeout=20,
+                    timeout=40,
                 )
             except Exception:
                 still_capped = True
                 notes.append("still screenshot timed out")
             height_capped = bool(height_capped or still_capped)
-            outer = await page.evaluate(
-                "() => document.documentElement ? document.documentElement.outerHTML : ''"
+            outer = await eval_page(
+                page,
+                "() => document.documentElement ? document.documentElement.outerHTML : ''",
             )
             dom_path.write_text(outer or "", encoding="utf-8")
 
@@ -489,7 +555,7 @@ async def scroll_page(page: Page, *, budget_s: float = 12) -> None:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + budget_s
     try:
-        step = int(await page.evaluate("() => window.innerHeight") or 900)
+        step = int(await eval_page(page, "() => window.innerHeight") or 900)
     except Exception:
         step = 900
     step = max(step, 1)
@@ -497,7 +563,7 @@ async def scroll_page(page: Page, *, budget_s: float = 12) -> None:
     last_height = 0
     while loop.time() < deadline:
         try:
-            height = int(await page.evaluate(HEIGHT_JS) or 0)
+            height = int(await eval_page(page, HEIGHT_JS) or 0)
         except Exception:
             break
         if height <= 0:
@@ -507,12 +573,12 @@ async def scroll_page(page: Page, *, budget_s: float = 12) -> None:
         last_height = height
         y = min(y + step, height)
         try:
-            await page.evaluate("(top) => window.scrollTo(0, top)", y)
+            await eval_page(page, "(top) => window.scrollTo(0, top)", y)
         except Exception:
             break
         await page.wait_for_timeout(80)
     try:
-        await page.evaluate("() => window.scrollTo(0, 0)")
+        await eval_page(page, "() => window.scrollTo(0, 0)")
     except Exception:
         pass
     await page.wait_for_timeout(150)
@@ -551,8 +617,12 @@ async def wait_until_stable(
         if remaining <= 0:
             break
         try:
-            signature = await asyncio.wait_for(page.evaluate(SIGNATURE_JS), timeout=min(2.0, remaining))
-        except Exception:
+            signature = await asyncio.wait_for(
+                eval_page(page, SIGNATURE_JS), timeout=min(4.0, remaining)
+            )
+        except Exception as exc:
+            if _is_nav_loss(exc):
+                await _settle(page)
             await asyncio.sleep(min(interval, max(0.0, deadline - loop.time())))
             continue
         now = loop.time()
@@ -568,7 +638,8 @@ async def wait_until_stable(
 
 
 async def _clamp_document_height(page: Page, height: int) -> None:
-    await page.evaluate(
+    await eval_page(
+        page,
         """(h) => {
           const root = document.documentElement;
           const body = document.body;
@@ -594,7 +665,7 @@ async def _screenshot(page: Page, path: Path, page_height: int, max_height: int)
     }
     capped = page_height > max_height
     try:
-        await page.screenshot(**kwargs)
+        await screenshot_page(page, **kwargs)
         return capped
     except Exception:
         pass
@@ -609,7 +680,7 @@ async def _screenshot(page: Page, path: Path, page_height: int, max_height: int)
         try:
             if limit is not None:
                 await _clamp_document_height(page, limit)
-            await page.screenshot(**kwargs)
+            await screenshot_page(page, **kwargs)
             return bool(capped or limit)
         except Exception:
             continue

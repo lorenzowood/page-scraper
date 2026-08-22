@@ -9,6 +9,8 @@ const addError = document.getElementById("add-error");
 const selectAll = document.getElementById("select-all");
 const removeBtn = document.getElementById("remove-btn");
 const rerunBtn = document.getElementById("rerun-btn");
+const retryBtn = document.getElementById("retry-btn");
+const retryDetailBtn = document.getElementById("retry-detail-btn");
 const removeDialog = document.getElementById("remove-dialog");
 const removeForm = document.getElementById("remove-form");
 const removeCopy = document.getElementById("remove-copy");
@@ -57,10 +59,19 @@ function fmtEta(seconds) {
   return `${s}s`;
 }
 
+function unsavedCount(job) {
+  if (job.unsaved != null) return job.unsaved;
+  return Math.max((job.failed || 0) - (job.partial || 0), 0);
+}
+
 function updateBulkButtons() {
   const n = checkedIds.size;
   removeBtn.disabled = n === 0;
   rerunBtn.disabled = n === 0;
+  const canRetry = [...jobsEl.querySelectorAll("tr[data-id].checked")].some(
+    (tr) => Number(tr.dataset.unsaved || 0) > 0
+  );
+  retryBtn.disabled = !canRetry;
   const rows = jobsEl.querySelectorAll("tr[data-id]");
   const checkedRows = jobsEl.querySelectorAll("tr[data-id].checked");
   selectAll.checked = rows.length > 0 && checkedRows.length === rows.length;
@@ -79,6 +90,7 @@ function renderJobs(data) {
     const pct = total ? Math.round((done / total) * 100) : 0;
     const tr = document.createElement("tr");
     tr.dataset.id = job.id;
+    tr.dataset.unsaved = String(unsavedCount(job));
     const isChecked = checkedIds.has(job.id);
     if (isChecked) tr.classList.add("checked");
     tr.innerHTML = `
@@ -138,6 +150,7 @@ async function showDetail(id, quiet = false) {
   document.getElementById("detail-title").textContent = job.name || job.id;
   document.getElementById("detail-meta").textContent =
     `${job.status} · ${job.done}/${job.total} · ETA ${fmtEta(job.eta_seconds)} · ${job.output_dir}`;
+  retryDetailBtn.disabled = unsavedCount(job) <= 0;
   itemsEl.innerHTML = "";
   for (const item of job.items || []) {
     const tr = document.createElement("tr");
@@ -218,6 +231,14 @@ document.getElementById("rerun-detail-btn").addEventListener("click", () => {
   if (!selectedId) return;
   rerunJobs([selectedId]);
 });
+retryDetailBtn.addEventListener("click", () => {
+  if (!selectedId) return;
+  retryJobs([selectedId]);
+});
+retryBtn.addEventListener("click", () => {
+  if (checkedIds.size === 0) return;
+  retryJobs([...checkedIds]);
+});
 document.getElementById("remove-cancel").addEventListener("click", () => removeDialog.close());
 removeForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -249,6 +270,21 @@ rerunBtn.addEventListener("click", () => {
   if (checkedIds.size === 0) return;
   rerunJobs([...checkedIds]);
 });
+
+async function retryJobs(ids) {
+  try {
+    const result = await api("/api/jobs/retry", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+    if (result.skipped && result.skipped.length && !(result.retried || []).length) {
+      countsEl.textContent = result.skipped.map((row) => row.reason).join("; ");
+    }
+    refresh();
+  } catch (err) {
+    countsEl.textContent = err.message;
+  }
+}
 
 async function rerunJobs(ids) {
   try {

@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--url",
         default=os.environ.get("PAGESCRAPER_URL")
-        or os.environ.get("PAGECAPTURE_URL", "http://127.0.0.1:8080"),
+        or os.environ.get("PAGECAPTURE_URL", "http://127.0.0.1:8081"),
         help="Service base URL (or PAGESCRAPER_URL)",
     )
     parser.add_argument(

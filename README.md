@@ -33,52 +33,108 @@ Layout matches `examples/`:
 
 `:` stands in for `/` so the homepage does not spill into the host directory. Extra presets land in a subfolder (`iphone/`, `no-css/`, `no-js/`).
 
-## VM size
+## Install (Debian + Docker, same host as qBittorrent)
 
-Chromium is the cost. A qBittorrent VM at 2 CPU / 2 GiB is more than this needs if you keep concurrency at 1.
+You do not need a separate VM. This is a second Compose stack on the box that already runs qBittorrent. It listens on **8081** so it does not clash with qBittorrent’s usual **8080**. Chromium is capped at **1.5 GiB** RAM and **1 CPU** in `docker-compose.yml`; leave `CONCURRENCY=1`. Make sure the host still has that RAM spare after qBittorrent.
 
-| | Recommendation |
-| --- | --- |
-| CPU | **1 vCPU** |
-| RAM | **1.5 GiB** (`mem_limit` in compose). 1 GiB is tight once a tall page is screenshot. |
-| Disk | **8–12 GiB** boot (Playwright image). Output goes on the NAS, not the boot disk. |
-| `/dev/shm` | compose sets `shm_size: 256mb` |
+Same storage pattern as qBittorrent: keep the SQLite job list and the capture files on a NAS share (or at least put captures on the NAS). Do not point `OUTPUT_DIR` at qBittorrent’s download folder if you want the same security split (locked-down inbox vs a share the scraper cannot write to after a move).
 
-Do not run two browser workers on that RAM. Leave `CONCURRENCY=1`.
+### 1. Compose plugin and git
 
-## Deploy (Proxmox + NAS)
-
-Same pattern as a qBittorrent setup: the container writes to a locked-down NAS inbox; a completion hook on the NAS can move finished jobs somewhere the service cannot reach.
+Docker Engine is not enough on its own. You need Compose v2 (`docker compose`, with a space) and git:
 
 ```bash
-cp .env.example .env
-# OUTPUT_DIR=/mnt/nas/page-scraper/inbox
-# DATA_DIR=/mnt/nas/page-scraper/state
-docker compose up -d --build
+sudo apt-get update
+sudo apt-get install -y git docker-compose-plugin
+docker compose version
 ```
 
-The Python package is copied into the image. After code changes, rebuild (`docker compose up -d --build --force-recreate`). Compose does not bind-mount the package.
+Your user should be in the `docker` group (`sudo usermod -aG docker "$USER"`, then log out and back in). Otherwise prefix the compose commands with `sudo`.
 
-Open `http://<vm>:8080`. Optional `API_TOKEN` in `.env`; the CLI uses `PAGESCRAPER_TOKEN` or `--token`. The UI can store a token in `localStorage` as `page-scraper-token`.
-
-Completion hook (optional):
+### 2. Clone the repo
 
 ```bash
+sudo mkdir -p /opt/page-scraper
+sudo chown "$USER:$USER" /opt/page-scraper
+git clone https://github.com/lorenzowood/page-scraper.git /opt/page-scraper
+cd /opt/page-scraper
+```
+
+### 3. NAS folders and `.env`
+
+Create an inbox (and optional state dir) on the same kind of mount you already use for qBittorrent, then copy the example env:
+
+```bash
+sudo mkdir -p /mnt/nas/page-scraper/inbox /mnt/nas/page-scraper/state
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```bash
+TZ=Europe/London
+DATA_DIR=/mnt/nas/page-scraper/state
+OUTPUT_DIR=/mnt/nas/page-scraper/inbox
+CONCURRENCY=1
+```
+
+`DATA_DIR` is the SQLite job list. `OUTPUT_DIR` is where PNG / HTML / MP4 land. Paths are **host** paths; Compose bind-mounts them into the container as `/data` and `/output`. Leave `API_TOKEN` empty until you want the UI/CLI to send a bearer token. Set it to a long random string if the host is reachable off-LAN.
+
+The first image build pulls Playwright’s Chromium image plus ffmpeg. That is a few gigabytes; the boot disk only needs room for images, not for captures.
+
+### 4. Build and start
+
+```bash
+cd /opt/page-scraper
+docker compose up -d --build
+docker compose ps
+curl -sS http://127.0.0.1:8081/api/health
+```
+
+You should see `{"ok":true,"version":"0.1.0"}`. Open `http://<server>:8081` from a browser. If you use `ufw`, allow the port (`sudo ufw allow 8081/tcp`).
+
+Queue a URL from the UI (**Add URLs**) or from the host:
+
+```bash
+docker compose exec page-scraper page-scraper add --wait https://example.com/
+```
+
+Files appear under `OUTPUT_DIR/{host}/:/`. `restart: unless-stopped` brings the container back after a reboot.
+
+### 5. Updates
+
+The Python package is **copied into the image**, not bind-mounted. After `git pull`, rebuild:
+
+```bash
+cd /opt/page-scraper
+git pull
+docker compose up -d --build --force-recreate
+```
+
+### Optional completion hook
+
+```bash
+# in .env, path is inside the container (OUTPUT_DIR is mounted at /output)
 ON_COMPLETE_HOOK=/output/hooks/on-complete.sh
 ```
 
-The process receives `JOB_ID`, `JOB_STATUS`, `JOB_OUTPUT_DIR`, `JOB_FAILED`, `JOB_TOTAL`. See `hooks/on-complete.example.sh`. If you want the qBittorrent security split, run the *move* script on the NAS via the API (`GET /api/jobs` until `status=completed`) rather than inside the container.
+Copy `hooks/on-complete.example.sh` into that inbox as `hooks/on-complete.sh`. The process receives `JOB_ID`, `JOB_STATUS`, `JOB_OUTPUT_DIR`, `JOB_FAILED`, `JOB_TOTAL`. If you want the qBittorrent-style move to a share this container cannot write, run the move on the NAS (or another host) by watching `GET /api/jobs` until `status=completed`, rather than inside this container.
 
-If a capture hangs the browser, the worker restarts Chromium. If that restart itself hangs, the process exits and Docker recreates it; in-flight items go back to `queued`.
+If a capture hangs Chromium, the worker recycles the browser. If that recycle hangs, the process exits, Docker recreates the container, and in-flight items go back to `queued`. Jobs live in SQLite under `DATA_DIR` (`page-scraper.sqlite3`; an older `pagecapture.sqlite3` is still used if that is what is already there). The UI is a live read of that database.
 
-Jobs live in SQLite under `DATA_DIR` (`page-scraper.sqlite3`; an older `pagecapture.sqlite3` is still used if that is what is already there). The UI is a live read of that database. A restart resets `running` items to `queued`.
+| | On this host |
+| --- | --- |
+| Extra CPU | **1** (`cpus: "1.0"`) |
+| Extra RAM | **1.5 GiB** (`mem_limit`). 1 GiB is tight once a tall page is screenshot. |
+| Boot disk | Playwright image, on the order of **8–12 GiB** the first time. Captures go on the NAS. |
+| `/dev/shm` | compose sets `shm_size: 256mb` (needed by Chromium) |
 
 ## CLI
 
-From this repo, or `pip install .` on a machine that can see the VM:
+From a machine that can see the service (`pip install .` in this repo, or use the binary inside the container):
 
 ```bash
-export PAGESCRAPER_URL=http://page-scraper.lan:8080
+export PAGESCRAPER_URL=http://<server>:8081
 
 page-scraper add https://orcarenewables.co.uk/
 page-scraper add -f urls.txt -p desktop -p iphone -o client-a --wait

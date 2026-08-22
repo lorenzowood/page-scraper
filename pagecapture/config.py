@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 8081
     data_dir: Path = Path("/data")
     output_root: Path = Path("/output")
     api_token: str = ""

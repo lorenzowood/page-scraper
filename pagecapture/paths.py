@@ -16,8 +16,15 @@ def parse_http_url(url: str) -> str:
     raw = url.strip()
     if not raw:
         raise ValueError("empty URL")
+    if "://" not in raw:
+        raw = f"https://{raw.lstrip('/')}"
     parsed = urlparse(raw)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    try:
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"not an http(s) URL: {url}") from exc
+    if parsed.scheme not in {"http", "https"} or not hostname:
         raise ValueError(f"not an http(s) URL: {url}")
     return raw
 

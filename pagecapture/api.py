@@ -155,12 +155,15 @@ async def create_job(
 ):
     _check_token(authorization, x_api_key)
     urls: list[str] = []
-    for raw in body.urls:
-        for piece in raw.replace(",", "\n").splitlines():
-            piece = piece.strip()
-            if not piece or piece.startswith("#"):
-                continue
-            urls.append(parse_http_url(piece))
+    try:
+        for raw in body.urls:
+            for piece in raw.replace(",", "\n").splitlines():
+                piece = piece.strip()
+                if not piece or piece.startswith("#"):
+                    continue
+                urls.append(parse_http_url(piece))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not urls:
         raise HTTPException(status_code=400, detail="no URLs provided")
 

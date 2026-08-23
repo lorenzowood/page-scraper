@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     add = sub.add_parser("add", help="Queue URLs for capture")
-    add.add_argument("urls", nargs="*", help="One or more http(s) URLs")
+    add.add_argument("urls", nargs="*", help="One or more URLs (https:// if you omit the scheme)")
     add.add_argument("-f", "--file", type=Path, help="File of URLs, one per line")
     add.add_argument("-n", "--name", help="Job name")
     add.add_argument("-o", "--output", help="Output directory inside the NAS root")

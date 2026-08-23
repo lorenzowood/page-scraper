@@ -6,3 +6,4 @@ data/
 output/
 .env
 .DS_Store
+.pytest_cache/

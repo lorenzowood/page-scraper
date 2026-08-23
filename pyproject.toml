@@ -16,6 +16,12 @@ dependencies = [
 [project.scripts]
 page-scraper = "pagecapture.cli:main"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
 [build-system]
 requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
@@ -25,3 +31,8 @@ include = ["pagecapture*"]
 
 [tool.setuptools.package-data]
 pagecapture = ["static/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

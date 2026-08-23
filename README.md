@@ -93,7 +93,7 @@ curl -sS http://127.0.0.1:8081/api/health
 
 You should see `{"ok":true,"version":"0.1.0"}`. Open `http://<server>:8081` from a browser. If you use `ufw`, allow the port (`sudo ufw allow 8081/tcp`).
 
-Queue a URL from the UI (**Add URLs**) or from the host:
+Queue a URL from the UI (**Add URLs**) or from the host. A host with no scheme is treated as `https://`.
 
 ```bash
 docker compose exec page-scraper page-scraper add --wait https://example.com/
@@ -128,6 +128,15 @@ If a capture hangs Chromium, the worker recycles the browser. If that recycle ha
 | Extra RAM | **1.5 GiB** (`mem_limit`). 1 GiB is tight once a tall page is screenshot. |
 | Boot disk | Playwright image, on the order of **8–12 GiB** the first time. Captures go on the NAS. |
 | `/dev/shm` | compose sets `shm_size: 256mb` (needed by Chromium) |
+
+## Tests
+
+No browser. The suite covers paths, cookie-label matching, job clone/retry, and the HTTP API with the worker stubbed out. Needs Python 3.12+ (same floor as the service).
+
+```bash
+python3 -m pip install -e '.[dev]'
+pytest
+```
 
 ## CLI
 

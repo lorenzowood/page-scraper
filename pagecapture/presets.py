@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-DESKTOP_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-)
+def chrome_desktop_ua(version: str) -> str:
+    """Desktop Chrome UA matching the bundled Chromium, not HeadlessChrome."""
+    ver = (version or "151.0.0.0").split()[0]
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{ver} Safari/537.36"
+    )
 
 IPHONE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -16,7 +19,6 @@ IPHONE_UA = (
 PRESETS: dict[str, dict[str, Any]] = {
     "desktop": {
         "viewport": {"width": 1440, "height": 900},
-        "user_agent": DESKTOP_UA,
         "javascript": True,
         "css": True,
         "is_mobile": False,

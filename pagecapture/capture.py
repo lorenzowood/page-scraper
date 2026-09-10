@@ -14,6 +14,7 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from .config import Settings
 from .cookies import dismiss_cookie_banners
 from .paths import timestamp_label, unique_path, url_output_dir
+from .presets import chrome_desktop_ua
 
 log = logging.getLogger("page-scraper.capture")
 
@@ -21,7 +22,16 @@ LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--hide-scrollbars",
+    "--disable-blink-features=AutomationControlled",
 ]
+
+HIDE_WEBDRIVER_JS = """
+(() => {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  } catch (e) {}
+})();
+"""
 
 # Below-the-fold carousels often pause until they intersect the window.
 # Force them to start so full-page frames actually show motion.
@@ -116,6 +126,116 @@ def _is_nav_loss(exc: BaseException) -> bool:
     return any(needle in text for needle in _NAV_LOSS)
 
 
+def should_continue_after_goto_error(exc: BaseException, page_url: str) -> bool:
+    """True when navigation timed out but Chromium already has an http(s) document."""
+    if "Timeout" not in str(exc):
+        return False
+    return page_url.startswith("http://") or page_url.startswith("https://")
+
+
+def is_retryable_failure(
+    reason: str | None, error: str | None, http_status: int | None
+) -> bool:
+    if reason in {"timeout", "oom", "screenshot"}:
+        return True
+    if http_status == 403:
+        return True
+    err = error or ""
+    if "ERR_HTTP2_PROTOCOL_ERROR" in err:
+        return True
+    if "chrome-error://" in err:
+        return True
+    if "Timeout" in err and "exceeded" in err:
+        return True
+    return False
+
+
+_OOM_MARKERS = (
+    "out of memory",
+    "enomem",
+    "cannot allocate memory",
+    "result_code_oom",
+    "oom_kill",
+    "oom-kill",
+    "ran out of memory",
+    "memory pressure",
+)
+
+_BROWSER_DEATH = (
+    "target closed",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "page crashed",
+    "renderer process",
+    "connection closed",
+)
+
+_CGROUP_EVENTS = Path("/sys/fs/cgroup/memory.events")
+_CGROUP_OOM_CONTROL = Path("/sys/fs/cgroup/memory/memory.oom_control")
+
+
+def existing_output(path: Path | None) -> str | None:
+    """Return the path string only when a non-empty file is on disk."""
+    if path is None:
+        return None
+    try:
+        if path.is_file() and path.stat().st_size > 0:
+            return str(path)
+    except OSError:
+        return None
+    return None
+
+
+def is_oom_error(error: str | None) -> bool:
+    text = (error or "").lower()
+    return any(marker in text for marker in _OOM_MARKERS)
+
+
+def read_cgroup_oom_kills() -> int:
+    """Container OOM-kill count, or 0 when cgroup memory stats are unavailable."""
+    try:
+        if _CGROUP_EVENTS.is_file():
+            for line in _CGROUP_EVENTS.read_text().splitlines():
+                if line.startswith("oom_kill "):
+                    return int(line.split()[1])
+        if _CGROUP_OOM_CONTROL.is_file():
+            for line in _CGROUP_OOM_CONTROL.read_text().splitlines():
+                if line.startswith("oom_kills "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return 0
+    return 0
+
+
+def _looks_like_browser_death(error: str | None) -> bool:
+    text = (error or "").lower()
+    return any(marker in text for marker in _BROWSER_DEATH)
+
+
+def apply_memory_failure(result: CaptureResult, oom_before: int) -> CaptureResult:
+    """If the cgroup OOM-killed a process or the error is OOM, say so explicitly."""
+    delta = max(0, read_cgroup_oom_kills() - oom_before)
+    oom = delta > 0 or is_oom_error(result.error) or result.reason == "oom"
+    if result.screenshot_path and result.status == "complete" and not is_oom_error(result.error):
+        return result
+    if not oom:
+        if result.status == "failed" and _looks_like_browser_death(result.error):
+            err = result.error or "browser process died"
+            if "memory" not in err.lower():
+                result.error = f"{err} (often out of memory)"
+        return result
+    result.status = "failed"
+    result.reason = "oom"
+    if not result.screenshot_path:
+        result.saved = False
+    detail = result.error or "PNG was not written"
+    if "out of memory" in detail.lower():
+        result.error = detail
+    else:
+        result.error = f"out of memory (container memory limit): {detail}"
+    return result
+
+
 async def _settle(page: Page, timeout_ms: float = 5000) -> None:
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
@@ -201,6 +321,7 @@ class BrowserEngine:
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=LAUNCH_ARGS,
+            ignore_default_args=["--enable-automation"],
         )
         self.captures = 0
 
@@ -239,23 +360,41 @@ class BrowserEngine:
         extra = 0
         if bool(options.get("video", self.settings.video)):
             extra = int(options.get("video_seconds", self.settings.video_seconds)) + 30
-        try:
-            result = await asyncio.wait_for(
-                self._capture_inner(url, output_root, options),
-                timeout=(timeout_ms / 1000) * 2 + 40 + extra,
-            )
-        except asyncio.TimeoutError:
-            result = CaptureResult(
-                status="failed",
-                reason="timeout",
-                error="capture watchdog fired",
-            )
-        except Exception as exc:
-            result = CaptureResult(
-                status="failed",
-                reason="crash",
-                error=str(exc),
-            )
+        budget = (timeout_ms / 1000) * 2 + 40 + extra
+        result = CaptureResult(status="failed", reason="crash")
+        for attempt in range(2):
+            oom_before = read_cgroup_oom_kills()
+            try:
+                result = await asyncio.wait_for(
+                    self._capture_inner(url, output_root, options),
+                    timeout=budget,
+                )
+            except asyncio.TimeoutError:
+                result = CaptureResult(
+                    status="failed",
+                    reason="timeout",
+                    error="capture watchdog fired",
+                )
+            except Exception as exc:
+                result = CaptureResult(
+                    status="failed",
+                    reason="crash",
+                    error=str(exc),
+                )
+            result = apply_memory_failure(result, oom_before)
+            if (
+                result.status != "failed"
+                or attempt == 1
+                or not is_retryable_failure(result.reason, result.error, result.http_status)
+            ):
+                break
+            log.warning("retrying %s after %s", url, result.error or result.reason)
+            if result.reason in {"timeout", "oom"}:
+                try:
+                    await self.restart()
+                except Exception:
+                    log.exception("browser restart after watchdog failed")
+                    break
         result.duration_ms = int((asyncio.get_event_loop().time() - started) * 1000)
         self.captures += 1
         return result
@@ -284,6 +423,9 @@ class BrowserEngine:
         video_fps = int(options.get("video_fps", self.settings.video_fps))
         video_seconds = int(options.get("video_seconds", self.settings.video_seconds))
 
+        if not user_agent:
+            user_agent = chrome_desktop_ua(self._require_browser().version)
+
         context_kwargs: dict[str, Any] = {
             "viewport": {"width": window_w, "height": window_h},
             "java_script_enabled": javascript,
@@ -291,12 +433,15 @@ class BrowserEngine:
             "is_mobile": bool(options.get("is_mobile", False)),
             "has_touch": bool(options.get("has_touch", False)),
             "ignore_https_errors": True,
+            "locale": "en-GB",
+            "timezone_id": "Europe/London",
+            "extra_http_headers": {"Accept-Language": "en-GB,en;q=0.9"},
+            "user_agent": user_agent,
         }
-        if user_agent:
-            context_kwargs["user_agent"] = user_agent
 
         context = await self._require_browser().new_context(**context_kwargs)
         if javascript:
+            await context.add_init_script(HIDE_WEBDRIVER_JS)
             await context.add_init_script(FORCE_IN_VIEW_JS)
 
         page: Page | None = None
@@ -315,13 +460,22 @@ class BrowserEngine:
                     url, wait_until="domcontentloaded", timeout=timeout_ms
                 )
             except Exception as exc:
-                result = CaptureResult(
-                    status="failed",
-                    reason="load",
-                    error=str(exc),
-                    http_status=None,
-                )
-                return result
+                current = page.url or ""
+                if should_continue_after_goto_error(exc, current):
+                    log.warning(
+                        "domcontentloaded timed out for %s; continuing with %s",
+                        url,
+                        current,
+                    )
+                    response = None
+                else:
+                    result = CaptureResult(
+                        status="failed",
+                        reason="load",
+                        error=str(exc),
+                        http_status=None,
+                    )
+                    return result
 
             http_status = response.status if response is not None else None
             current = page.url or ""
@@ -471,24 +625,41 @@ class BrowserEngine:
             # Banners can appear during encode (WDS waits on window.load + 500ms).
             await try_cookies()
 
-            height = int(await eval_page(page, HEIGHT_JS) or 0)
-            height_capped = height > max_height
+            height = 0
+            height_capped = False
             notes: list[str] = []
             try:
-                still_capped = await asyncio.wait_for(
-                    _screenshot(page, screenshot_path, height, max_height),
-                    timeout=40,
-                )
-            except Exception:
-                still_capped = True
-                notes.append("still screenshot timed out")
-            height_capped = bool(height_capped or still_capped)
-            outer = await eval_page(
-                page,
-                "() => document.documentElement ? document.documentElement.outerHTML : ''",
-            )
-            dom_path.write_text(outer or "", encoding="utf-8")
+                height = int(await eval_page(page, HEIGHT_JS) or 0)
+                height_capped = height > max_height
+                try:
+                    still_capped = await asyncio.wait_for(
+                        _screenshot(page, screenshot_path, height, max_height),
+                        timeout=40,
+                    )
+                except Exception as exc:
+                    still_capped = True
+                    notes.append(f"still screenshot timed out: {exc}")
+                height_capped = bool(height_capped or still_capped)
+                try:
+                    outer = await eval_page(
+                        page,
+                        "() => document.documentElement ? document.documentElement.outerHTML : ''",
+                    )
+                    dom_path.write_text(outer or "", encoding="utf-8")
+                except Exception as exc:
+                    notes.append(f"DOM not saved: {exc}")
+            except Exception as exc:
+                notes.append(str(exc))
 
+            result_shot = existing_output(screenshot_path)
+            result_dom = existing_output(dom_path)
+            result_video = existing_output(Path(result_video)) if result_video else None
+
+            viewport_now = None
+            try:
+                viewport_now = page.viewport_size
+            except Exception:
+                pass
             meta = {
                 "url": url,
                 "preset": options.get("preset"),
@@ -500,30 +671,58 @@ class BrowserEngine:
                 "javascript": javascript,
                 "css": css,
                 "viewport": {"width": window_w, "height": window_h},
-                "capture_viewport": page.viewport_size,
+                "capture_viewport": viewport_now,
                 "video_fps": round(playback_fps, 4) if result_video else None,
-                "video": video_path.name if result_video else None,
+                "video": Path(result_video).name if result_video else None,
             }
-            (directory / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            try:
+                (directory / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            except OSError:
+                notes.append("meta.json not saved")
 
             if not stable:
                 notes.append("page did not stay stable; captured anyway")
             if record_video and not result_video:
                 notes.append("video encode failed")
-            result = CaptureResult(
-                status="complete",
-                reason=None if stable else "unstable",
-                saved=True,
-                screenshot_path=str(screenshot_path),
-                dom_path=str(dom_path),
-                video_path=result_video,
-                output_path=str(directory),
-                http_status=http_status,
-                height_px=height,
-                cookie_dismissed=cookie_dismissed,
-                height_capped=height_capped,
-                warnings=notes,
-            )
+            if not result_shot:
+                notes.append("PNG was not written")
+            problems = [
+                note
+                for note in notes
+                if note != "page did not stay stable; captured anyway"
+            ]
+            if not result_shot:
+                result = CaptureResult(
+                    status="failed",
+                    reason="screenshot",
+                    saved=False,
+                    error="; ".join(problems) or "PNG was not written",
+                    screenshot_path=None,
+                    dom_path=result_dom,
+                    video_path=result_video,
+                    output_path=str(directory),
+                    http_status=http_status,
+                    height_px=height,
+                    cookie_dismissed=cookie_dismissed,
+                    height_capped=height_capped,
+                    warnings=notes,
+                )
+            else:
+                result = CaptureResult(
+                    status="complete",
+                    reason=None if stable else "unstable",
+                    saved=True,
+                    error="; ".join(problems) if problems else None,
+                    screenshot_path=result_shot,
+                    dom_path=result_dom,
+                    video_path=result_video,
+                    output_path=str(directory),
+                    http_status=http_status,
+                    height_px=height,
+                    cookie_dismissed=cookie_dismissed,
+                    height_capped=height_capped,
+                    warnings=notes,
+                )
             return result
         finally:
             if ffmpeg is not None:

@@ -21,6 +21,7 @@ Failure policy:
 
 - Page does not load (navigation error, HTTP 4xx/5xx, empty document): **no files**, item marked `failed` / `load`
 - Page loads but never goes quiet (ticking clock, live widgets, carousel): **keep PNG + DOM + video**, item marked `complete` with reason `unstable`
+- PNG is missing (Chromium OOM, screenshot timeout, encoder killed): **do not link a 404**; item marked `failed` / `oom` or `screenshot`, with `error` set. `Retry errors` will pick these up.
 
 Layout matches `examples/`:
 
@@ -35,7 +36,7 @@ Layout matches `examples/`:
 
 ## Install (Debian + Docker, same host as qBittorrent)
 
-You do not need a separate VM. This is a second Compose stack on the box that already runs qBittorrent. It listens on **8081** so it does not clash with qBittorrent’s usual **8080**. Chromium is capped at **1.5 GiB** RAM and **1 CPU** in `docker-compose.yml`; leave `CONCURRENCY=1`. Make sure the host still has that RAM spare after qBittorrent.
+You do not need a separate VM. This is a second Compose stack on the box that already runs qBittorrent. It listens on **8081** so it does not clash with qBittorrent’s usual **8080**. Chromium is capped at **2.5 GiB** RAM and **1 CPU** in `docker-compose.yml`; leave `CONCURRENCY=1`. Make sure the host still has that RAM spare after qBittorrent (a 4 GiB VM is the practical minimum beside qBittorrent).
 
 Same storage pattern as qBittorrent: keep the SQLite job list and the capture files on a NAS share (or at least put captures on the NAS). Do not point `OUTPUT_DIR` at qBittorrent’s download folder if you want the same security split (locked-down inbox vs a share the scraper cannot write to after a move).
 
@@ -91,7 +92,7 @@ docker compose ps
 curl -sS http://127.0.0.1:8081/api/health
 ```
 
-You should see `{"ok":true,"version":"0.1.0"}`. Open `http://<server>:8081` from a browser. If you use `ufw`, allow the port (`sudo ufw allow 8081/tcp`).
+You should see `{"ok":true,"version":"0.1.0"}` (plus `cgroup_oom_kills` if the container has already killed a process). Open `http://<server>:8081` from a browser. If you use `ufw`, allow the port (`sudo ufw allow 8081/tcp`).
 
 Queue a URL from the UI (**Add URLs**) or from the host. A host with no scheme is treated as `https://`.
 
@@ -111,6 +112,12 @@ git pull
 docker compose up -d --build --force-recreate
 ```
 
+If you are not in `/opt/page-scraper`, the running container knows where Compose was started from:
+
+```bash
+docker inspect page-scraper --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}'
+```
+
 ### Optional completion hook
 
 ```bash
@@ -125,13 +132,13 @@ If a capture hangs Chromium, the worker recycles the browser. If that recycle ha
 | | On this host |
 | --- | --- |
 | Extra CPU | **1** (`cpus: "1.0"`) |
-| Extra RAM | **1.5 GiB** (`mem_limit`). 1 GiB is tight once a tall page is screenshot. |
+| Extra RAM | **2.5 GiB** (`mem_limit: 2500m`) for Chromium + ffmpeg. A busy full-page capture (YouTube embeds, looping hero video) peaked around **1.5–1.7 GiB** here. Beside qBittorrent, give the **VM 4 GiB**. A 2 GiB box will OOM those pages even if quieter sites succeed. |
 | Boot disk | Playwright image, on the order of **8–12 GiB** the first time. Captures go on the NAS. |
 | `/dev/shm` | compose sets `shm_size: 256mb` (needed by Chromium) |
 
 ## Tests
 
-No browser. The suite covers paths, cookie-label matching, job clone/retry, and the HTTP API with the worker stubbed out. Needs Python 3.12+ (same floor as the service).
+No browser. The suite covers paths, cookie-label matching, job clone/retry, OOM/missing-PNG reporting, and the HTTP API with the worker stubbed out. Needs Python 3.12+ (same floor as the service).
 
 ```bash
 python3 -m pip install -e '.[dev]'
@@ -184,14 +191,15 @@ docker compose exec page-scraper page-scraper add --wait https://example.com/
 }
 ```
 
+`GET /api/health` — `{ "ok": true, "version": "…" }`. Adds `cgroup_oom_kills` when the container has killed a process.  
 `GET /api/jobs` — list + counts + `eta_seconds`  
-`GET /api/jobs/{id}` — items, including `screenshot_url` / `dom_url` / `video_url` / `meta_url`  
-`GET /api/jobs/{id}/items/{item_id}/{screenshot|dom|video|meta}` — the file itself (paths must sit under the output root)  
+`GET /api/jobs/{id}` — items, including `screenshot_url` / `dom_url` / `video_url` / `meta_url` **only when that file exists on disk**. Ghost paths are omitted; `missing` lists the kinds (`png`, `html`, `video`) and `error` is set (for example `missing on disk: png`). Failed items use `reason` `load`, `oom`, `screenshot`, `timeout`, `crash`, plus an `error` string. The UI shows `reason` and `error` together.  
+`GET /api/jobs/{id}/items/{item_id}/{screenshot|dom|video|meta}` — the file itself (paths must sit under the output root); **404** if it is gone  
 `POST /api/jobs/{id}/cancel`  
 `DELETE /api/jobs/{id}?delete_files=false` — drop from the list; `delete_files=true` also removes that job's PNG/DOM/video, `meta.json`, and empty folders  
 `POST /api/jobs/delete` — `{ "ids": ["…"], "delete_files": false }`  
 `POST /api/jobs/{id}/rerun` / `POST /api/jobs/rerun` — `{ "ids": ["…"] }` queues a **new** job with the same URLs, presets, and options. The original job and its files stay put.  
-`POST /api/jobs/{id}/retry` / `POST /api/jobs/retry` — `{ "ids": ["…"] }` re-queues items in that job that never wrote files (`crash`, `load`, cancelled leftovers). Successful captures are left alone.
+`POST /api/jobs/{id}/retry` / `POST /api/jobs/retry` — `{ "ids": ["…"] }` re-queues items in that job that never wrote a PNG (`oom`, `screenshot`, `crash`, `load`, cancelled leftovers). Successful captures are left alone.
 
 If the page navigates after load (cookie reload, JS redirect), the worker waits for the new document and continues instead of marking the item `crash`.
 

@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pagecapture import api
+from pagecapture.api import _with_file_urls
 from pagecapture.config import settings
 from pagecapture.db import Database
 
@@ -108,3 +109,35 @@ def test_api_token_required(client: TestClient, monkeypatch):
     assert client.get("/api/jobs").status_code == 401
     ok = client.get("/api/jobs", headers={"Authorization": "Bearer secret"})
     assert ok.status_code == 200
+
+
+def test_file_urls_omit_missing_and_set_error(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "output_root", tmp_path)
+    shot = tmp_path / "shot.png"
+    shot.write_bytes(b"png")
+    out = _with_file_urls(
+        "job1",
+        {
+            "id": "abc",
+            "status": "complete",
+            "screenshot_path": str(shot),
+            "dom_path": str(tmp_path / "missing.html"),
+            "video_path": None,
+            "output_path": str(tmp_path),
+        },
+    )
+    assert out["screenshot_url"] == "/api/jobs/job1/items/abc/screenshot"
+    assert "dom_url" not in out
+    assert out["missing"] == ["html"]
+    assert "missing on disk: html" in out["error"]
+
+
+def test_file_urls_flag_complete_item_without_png(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "output_root", tmp_path)
+    out = _with_file_urls(
+        "job1",
+        {"id": "abc", "status": "complete", "screenshot_path": None},
+    )
+    assert "screenshot_url" not in out
+    assert out["missing"] == ["png"]
+    assert out["error"] == "missing on disk: png"

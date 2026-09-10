@@ -1,6 +1,16 @@
 import pytest
 
-from pagecapture.capture import _is_nav_loss, _playback_fps, eval_page
+from pagecapture.capture import (
+    CaptureResult,
+    _is_nav_loss,
+    _playback_fps,
+    apply_memory_failure,
+    eval_page,
+    existing_output,
+    is_oom_error,
+    is_retryable_failure,
+    should_continue_after_goto_error,
+)
 
 
 @pytest.mark.parametrize(
@@ -15,6 +25,32 @@ from pagecapture.capture import _is_nav_loss, _playback_fps, eval_page
 )
 def test_is_nav_loss(message: str, expected: bool):
     assert _is_nav_loss(RuntimeError(message)) is expected
+
+
+@pytest.mark.parametrize(
+    "reason, error, http_status, expected",
+    [
+        ("timeout", "capture watchdog fired", None, True),
+        ("oom", "out of memory (container memory limit): PNG was not written", None, True),
+        ("screenshot", "PNG was not written", None, True),
+        ("load", "HTTP 403", 403, True),
+        ("load", "Page.goto: Timeout 30000ms exceeded.", None, True),
+        ("load", "net::ERR_HTTP2_PROTOCOL_ERROR", None, True),
+        ("load", "browser error page (chrome-error://chromewebdata/)", 200, True),
+        ("load", "HTTP 404", 404, False),
+        ("load", "HTTP 500", 500, False),
+        ("load", "net::ERR_NAME_NOT_RESOLVED", None, False),
+    ],
+)
+def test_is_retryable_failure(reason, error, http_status, expected):
+    assert is_retryable_failure(reason, error, http_status) is expected
+
+
+def test_continue_after_goto_timeout_if_document_exists():
+    exc = RuntimeError("Page.goto: Timeout 30000ms exceeded.")
+    assert should_continue_after_goto_error(exc, "https://example.com/") is True
+    assert should_continue_after_goto_error(exc, "chrome-error://chromewebdata/") is False
+    assert should_continue_after_goto_error(RuntimeError("net::ERR_NAME_NOT_RESOLVED"), "https://x/") is False
 
 
 def test_playback_fps_uses_wall_clock_span():
@@ -51,3 +87,56 @@ async def test_eval_page_reraises_other_errors():
 
     with pytest.raises(RuntimeError, match="HTTP 500"):
         await eval_page(Boom(), "() => 1")
+
+
+def test_existing_output_requires_nonempty_file(tmp_path):
+    missing = tmp_path / "nope.png"
+    empty = tmp_path / "empty.png"
+    empty.write_bytes(b"")
+    ok = tmp_path / "ok.png"
+    ok.write_bytes(b"png")
+    assert existing_output(missing) is None
+    assert existing_output(empty) is None
+    assert existing_output(ok) == str(ok)
+
+
+def test_is_oom_error_from_chromium_text():
+    assert is_oom_error("RESULT_CODE_OOM") is True
+    assert is_oom_error("cannot allocate memory") is True
+    assert is_oom_error("Target closed") is False
+
+
+def test_apply_memory_failure_promotes_crash_when_cgroup_kills(monkeypatch):
+    monkeypatch.setattr("pagecapture.capture.read_cgroup_oom_kills", lambda: 3)
+    result = CaptureResult(
+        status="failed",
+        reason="crash",
+        error="Target closed",
+    )
+    out = apply_memory_failure(result, oom_before=2)
+    assert out.reason == "oom"
+    assert out.status == "failed"
+    assert "out of memory" in (out.error or "")
+
+
+def test_apply_memory_failure_hints_when_browser_dies():
+    result = CaptureResult(
+        status="failed",
+        reason="crash",
+        error="Target page, context or browser has been closed",
+    )
+    out = apply_memory_failure(result, oom_before=0)
+    assert out.reason == "crash"
+    assert "often out of memory" in (out.error or "")
+
+
+def test_apply_memory_failure_keeps_complete_when_png_exists(monkeypatch):
+    monkeypatch.setattr("pagecapture.capture.read_cgroup_oom_kills", lambda: 1)
+    result = CaptureResult(
+        status="complete",
+        saved=True,
+        screenshot_path="/output/shot.png",
+    )
+    out = apply_memory_failure(result, oom_before=0)
+    assert out.status == "complete"
+    assert out.reason is None

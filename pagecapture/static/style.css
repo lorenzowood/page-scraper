@@ -74,3 +74,4 @@ fieldset { border: 1px solid var(--line); display: flex; gap: 1rem; }
 .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }
 a.file { color: var(--accent); text-decoration: none; }
 a.file:hover { text-decoration: underline; }
+td.issue { color: var(--bad); }

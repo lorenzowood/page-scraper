@@ -158,13 +158,15 @@ async function showDetail(id, quiet = false) {
       item.screenshot_url ? `<a class="file" href="${escapeHtml(item.screenshot_url)}" target="_blank" rel="noreferrer">png</a>` : "",
       item.dom_url ? `<a class="file" href="${escapeHtml(item.dom_url)}" target="_blank" rel="noreferrer">html</a>` : "",
     ].filter(Boolean);
-    tr.innerHTML = `
+      const note = [item.reason, item.error].filter(Boolean).join(" — ");
+      const issue = item.status === "failed" || item.error || (item.missing && item.missing.length);
+      tr.innerHTML = `
       <td><span class="pill ${item.status}">${item.status}</span></td>
       <td>${files.join(" · ") || "no"}</td>
       <td>${item.video_url ? `<a class="file" href="${escapeHtml(item.video_url)}" target="_blank" rel="noreferrer">mp4</a>` : "no"}</td>
       <td>${escapeHtml(item.preset)}</td>
       <td>${escapeHtml(item.url)}</td>
-      <td>${escapeHtml(item.reason || item.error || "")}</td>`;
+      <td class="${issue ? "issue" : ""}">${escapeHtml(note)}</td>`;
     itemsEl.appendChild(tr);
   }
   if (!quiet) detailEl.scrollIntoView({ behavior: "smooth" });

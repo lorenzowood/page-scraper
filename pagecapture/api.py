@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .capture import read_cgroup_oom_kills
 from .config import settings
 from .db import Database
 from .paths import parse_http_url, resolve_output_dir, resolve_output_file, unlink_capture_files
@@ -110,7 +111,11 @@ async def index():
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "version": __version__}
+    payload = {"ok": True, "version": __version__}
+    oom_kills = read_cgroup_oom_kills()
+    if oom_kills:
+        payload["cgroup_oom_kills"] = oom_kills
+    return payload
 
 
 @app.get("/api/config")
@@ -372,14 +377,34 @@ async def _delete_jobs(job_ids: list[str], delete_files: bool) -> dict[str, Any]
 def _with_file_urls(job_id: str, item: dict[str, Any]) -> dict[str, Any]:
     item = dict(item)
     base = f"/api/jobs/{job_id}/items/{item['id']}"
-    if item.get("screenshot_path"):
-        item["screenshot_url"] = f"{base}/screenshot"
-    if item.get("dom_path"):
-        item["dom_url"] = f"{base}/dom"
-    if item.get("video_path"):
-        item["video_url"] = f"{base}/video"
-    if item.get("output_path"):
+    missing: list[str] = []
+    kinds = (
+        ("png", "screenshot_path", "screenshot_url", "screenshot"),
+        ("html", "dom_path", "dom_url", "dom"),
+        ("video", "video_path", "video_url", "video"),
+    )
+    for label, path_key, url_key, kind in kinds:
+        raw = item.get(path_key)
+        if not raw:
+            if label == "png" and item.get("status") == "complete":
+                missing.append(label)
+            continue
+        if resolve_output_file(settings.output_root, raw) is None:
+            missing.append(label)
+            continue
+        item[url_key] = f"{base}/{kind}"
+    directory = item.get("output_path")
+    meta_raw = str(Path(directory) / "meta.json") if directory else None
+    if meta_raw and resolve_output_file(settings.output_root, meta_raw) is not None:
         item["meta_url"] = f"{base}/meta"
+    if missing:
+        item["missing"] = missing
+        extra = f"missing on disk: {', '.join(missing)}"
+        if item.get("error"):
+            if extra not in str(item["error"]):
+                item["error"] = f"{item['error']}; {extra}"
+        else:
+            item["error"] = extra
     return item
 
 

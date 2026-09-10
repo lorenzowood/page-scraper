@@ -1,6 +1,13 @@
 import pytest
 
-from pagecapture.presets import known_presets, merge_preset
+from pagecapture.presets import chrome_desktop_ua, known_presets, merge_preset
+
+
+def test_chrome_desktop_ua_matches_chromium_version():
+    ua = chrome_desktop_ua("151.0.7922.34")
+    assert "Chrome/151.0.7922.34" in ua
+    assert "HeadlessChrome" not in ua
+    assert "Windows NT 10.0" in ua
 
 
 def test_known_presets_include_desktop_and_iphone():

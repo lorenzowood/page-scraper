@@ -180,6 +180,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(
             f"  {item['status']:9} {flag:8}{video:6} {item['preset']:8} {item['url']}"
             + (f"  {item['reason']}" if item.get("reason") else "")
+            + (f"  {item['error']}" if item.get("error") else "")
         )
 
 

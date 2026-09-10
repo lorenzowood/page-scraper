@@ -32,7 +32,7 @@ def test_is_nav_loss(message: str, expected: bool):
     [
         ("timeout", "capture watchdog fired", None, True),
         ("oom", "out of memory (container memory limit): PNG was not written", None, True),
-        ("screenshot", "PNG was not written", None, True),
+        ("screenshot", "PNG was not written", None, False),
         ("load", "HTTP 403", 403, True),
         ("load", "Page.goto: Timeout 30000ms exceeded.", None, True),
         ("load", "net::ERR_HTTP2_PROTOCOL_ERROR", None, True),
@@ -163,3 +163,9 @@ def test_ffmpeg_scale_filter_pads_to_max_even_size():
     vf = ffmpeg_scale_filter(frames)
     assert "pad=1450:5532" in vf
     assert ffmpeg_scale_filter([]) == "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+
+async def test_png_from_jpeg_rejects_empty(tmp_path):
+    from pagecapture.capture import png_from_jpeg
+
+    assert await png_from_jpeg(b"", tmp_path / "x.png") is False

@@ -136,6 +136,26 @@ YOUTUBE_POSTERS_JS = """() => {
   return n;
 }"""
 
+# Oversized position:fixed SEO layers (Duda) make Chromium's full-page
+# compositor hang. Hide them before any screenshot, not only the still.
+HIDE_HUGE_FIXED_JS = """() => {
+  const vh = window.innerHeight || 900;
+  let n = 0;
+  for (const el of document.querySelectorAll('*')) {
+    let pos;
+    try { pos = getComputedStyle(el).position; } catch (e) { continue; }
+    if (pos !== 'fixed' && pos !== 'sticky') continue;
+    const r = el.getBoundingClientRect();
+    if (r.height < vh * 2.5) continue;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'header' || tag === 'nav') continue;
+    if (el.querySelector('header, nav, video')) continue;
+    el.style.setProperty('display', 'none', 'important');
+    n += 1;
+  }
+  return n;
+}"""
+
 # Full-page screenshots scroll internally; Duda/Elementor then slide things in
 # mid-stitch (same as a browser plugin's first pass). Freeze first.
 FREEZE_STILL_JS = """() => {
@@ -162,18 +182,6 @@ FREEZE_STILL_JS = """() => {
     el.style.setProperty('transform', 'none', 'important');
     el.style.setProperty('visibility', 'visible', 'important');
   });
-  const vh = window.innerHeight || 900;
-  for (const el of document.querySelectorAll('*')) {
-    let pos;
-    try { pos = getComputedStyle(el).position; } catch (e) { continue; }
-    if (pos !== 'fixed' && pos !== 'sticky') continue;
-    const r = el.getBoundingClientRect();
-    if (r.height < vh * 2.5) continue;
-    const tag = (el.tagName || '').toLowerCase();
-    if (tag === 'header' || tag === 'nav') continue;
-    if (el.querySelector('header, nav, video')) continue;
-    el.style.setProperty('display', 'none', 'important');
-  }
   return true;
 }"""
 
@@ -201,7 +209,7 @@ def should_continue_after_goto_error(exc: BaseException, page_url: str) -> bool:
 def is_retryable_failure(
     reason: str | None, error: str | None, http_status: int | None
 ) -> bool:
-    if reason in {"timeout", "oom", "screenshot"}:
+    if reason in {"timeout", "oom"}:
         return True
     if http_status == 403:
         return True
@@ -300,6 +308,39 @@ def ffmpeg_scale_filter(frames: list[bytes]) -> str:
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
     )
+
+
+async def png_from_jpeg(jpeg: bytes, dest: Path) -> bool:
+    """Write a PNG via ffmpeg when Chromium's PNG screenshot will not finish."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not jpeg:
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-y",
+        "-f",
+        "mjpeg",
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        str(dest),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, _err = await asyncio.wait_for(proc.communicate(jpeg), timeout=20)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        dest.unlink(missing_ok=True)
+        return False
+    if proc.returncode != 0 or not existing_output(dest):
+        dest.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def is_oom_error(error: str | None) -> bool:
@@ -673,6 +714,10 @@ class BrowserEngine:
                 await eval_page(page, YOUTUBE_POSTERS_JS)
             except Exception:
                 log.exception("could not replace YouTube embeds for %s", url)
+            try:
+                await eval_page(page, HIDE_HUGE_FIXED_JS)
+            except Exception:
+                log.exception("could not hide oversized fixed layers for %s", url)
 
             directory = url_output_dir(output_root, url)
             if options.get("preset") and options["preset"] != "desktop":
@@ -760,16 +805,39 @@ class BrowserEngine:
                 height_capped = height > max_height
                 try:
                     await eval_page(page, FREEZE_STILL_JS)
+                    await eval_page(page, HIDE_HUGE_FIXED_JS)
                 except Exception:
                     log.exception("could not freeze page for still %s", url)
                 try:
                     still_capped = await asyncio.wait_for(
                         _screenshot(page, screenshot_path, height, max_height),
-                        timeout=40,
+                        timeout=35,
                     )
                 except Exception as exc:
                     still_capped = True
                     notes.append(f"still screenshot timed out: {_exc_text(exc)}")
+                if not existing_output(screenshot_path):
+                    jpeg_still: bytes | None = None
+                    try:
+                        jpeg_still = await asyncio.wait_for(
+                            screenshot_page(
+                                page,
+                                type="jpeg",
+                                quality=85,
+                                full_page=True,
+                                animations="allow",
+                                caret="hide",
+                                scale="css",
+                            ),
+                            timeout=20,
+                        )
+                    except Exception as exc:
+                        notes.append(f"JPEG still failed: {_exc_text(exc)}")
+                    if jpeg_still is None and jpeg_frames:
+                        jpeg_still = jpeg_frames[-1]
+                    if jpeg_still and await png_from_jpeg(jpeg_still, screenshot_path):
+                        notes.append("PNG written from JPEG frame")
+                        still_capped = bool(still_capped)
                 height_capped = bool(height_capped or still_capped)
                 try:
                     outer = await eval_page(
@@ -989,21 +1057,16 @@ async def _screenshot(page: Page, path: Path, page_height: int, max_height: int)
         "path": str(path),
         "type": "png",
         "full_page": True,
+        "animations": "allow",
         "caret": "hide",
         "scale": "css",
     }
     capped = page_height > max_height
-    # Freeze CSS already paused motion; `disabled` can hang on Duda/video pages.
-    for animations in ("allow", "disabled"):
-        try:
-            await asyncio.wait_for(
-                screenshot_page(page, **kwargs, animations=animations),
-                timeout=12,
-            )
-            return capped
-        except Exception:
-            continue
-    kwargs["animations"] = "allow"
+    try:
+        await screenshot_page(page, **kwargs)
+        return capped
+    except Exception:
+        pass
     kwargs["full_page"] = True
     limits = [max_height] if capped else [None]
     limits.extend(cap for cap in (16_384, 8_192, 4_096) if cap < (page_height or max_height))
@@ -1015,7 +1078,7 @@ async def _screenshot(page: Page, path: Path, page_height: int, max_height: int)
         try:
             if limit is not None:
                 await _clamp_document_height(page, limit)
-            await asyncio.wait_for(screenshot_page(page, **kwargs), timeout=8)
+            await screenshot_page(page, **kwargs)
             return bool(capped or limit)
         except Exception:
             continue

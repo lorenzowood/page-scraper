@@ -140,3 +140,26 @@ def test_apply_memory_failure_keeps_complete_when_png_exists(monkeypatch):
     out = apply_memory_failure(result, oom_before=0)
     assert out.status == "complete"
     assert out.reason is None
+
+
+def _sof0_jpeg(width: int, height: int) -> bytes:
+    payload = bytes([8]) + height.to_bytes(2, "big") + width.to_bytes(2, "big") + bytes(
+        [1, 1, 0x11, 0]
+    )
+    return b"\xff\xd8\xff\xc0" + (2 + len(payload)).to_bytes(2, "big") + payload + b"\xff\xd9"
+
+
+def test_jpeg_size_reads_sof0():
+    from pagecapture.capture import jpeg_size
+
+    assert jpeg_size(_sof0_jpeg(1440, 5532)) == (1440, 5532)
+    assert jpeg_size(b"not a jpeg") is None
+
+
+def test_ffmpeg_scale_filter_pads_to_max_even_size():
+    from pagecapture.capture import ffmpeg_scale_filter
+
+    frames = [_sof0_jpeg(1440, 5200), _sof0_jpeg(1450, 5532)]
+    vf = ffmpeg_scale_filter(frames)
+    assert "pad=1450:5532" in vf
+    assert ffmpeg_scale_filter([]) == "scale=trunc(iw/2)*2:trunc(ih/2)*2"

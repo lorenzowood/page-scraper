@@ -14,7 +14,9 @@ Defaults:
 - DOM as `document.documentElement.outerHTML` after JS has run
 - Wait until the DOM signature is unchanged for **5s**, give up after **30s**
 - Cookie banners: hide known overlays first (so “Allow all” handlers that reload the page do not interrupt the capture), then click visible Accept/Allow/Reject-style buttons (and known CMP selectors). Retry after scroll, every **5s** while waiting, and again immediately before the still PNG. Leftover bars with no clickable Accept (GOV.UK `#global-cookie-message`, WDS `.cookie-policy`) are hidden.
-- Viewport **H.264** sampled at up to **5 fps** for **30s** (`VIDEO_SECONDS`, x264 `qp 0`, full document height). Playback uses the wall-clock span of those frames, so it runs in real time even when a tall page screenshot is slower than 5 fps. The window stays 1440×900; each frame is a full-page JPEG (`full_page=True`). Use VLC or mpv; Finder/QuickTime often show a black frame on this encode. If the page goes quiet first, the clip ends there.
+- Viewport **H.264** sampled at up to **5 fps** for **30s** (`VIDEO_SECONDS`, x264 `qp 0`, full document height). Playback uses the wall-clock span of those frames, so it runs in real time even when a tall page screenshot is slower than 5 fps. Frames are padded to a constant size so ffmpeg does not abort when the page grows mid-clip. The window stays 1440×900; each frame is a full-page JPEG (`full_page=True`). Use VLC or mpv; Finder/QuickTime often show a black frame on this encode. If the page goes quiet first, the clip ends there.
+- YouTube iframes cannot play in headless Chromium; they are replaced with the public poster image before capture.
+- Before the still PNG, motion is frozen (CSS animations off, videos paused, oversized `position:fixed` SEO layers hidden) so a full-page stitch does not capture Duda/Elementor slide-ins the way a first-pass browser plugin does.
 - Height cap **50,000px** (Chromium may refuse huge bitmaps; the worker falls back to 16384 / 8192)
 
 Failure policy:

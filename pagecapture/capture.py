@@ -112,6 +112,71 @@ EMPTY_JS = """() => {
   return { html: html.length, text: (text || "").trim().length };
 }"""
 
+# Headless Chromium does not run YouTube. Swap embeds for the public poster
+# so the PNG/clip show a frame instead of a black box.
+YOUTUBE_POSTERS_JS = """() => {
+  const re = /(?:youtube(?:-nocookie)?\\.com\\/embed\\/|youtu\\.be\\/)([A-Za-z0-9_-]{6,})/;
+  let n = 0;
+  for (const iframe of Array.from(document.querySelectorAll('iframe'))) {
+    const src = iframe.src || iframe.getAttribute('data-src') || '';
+    const match = src.match(re);
+    if (!match) continue;
+    const img = document.createElement('img');
+    img.src = 'https://i.ytimg.com/vi/' + match[1] + '/hqdefault.jpg';
+    img.alt = iframe.title || 'YouTube';
+    img.width = iframe.offsetWidth || 640;
+    img.height = iframe.offsetHeight || 360;
+    img.style.display = 'block';
+    img.style.width = (iframe.offsetWidth || 640) + 'px';
+    img.style.height = (iframe.offsetHeight || 360) + 'px';
+    img.style.objectFit = 'cover';
+    iframe.replaceWith(img);
+    n += 1;
+  }
+  return n;
+}"""
+
+# Full-page screenshots scroll internally; Duda/Elementor then slide things in
+# mid-stitch (same as a browser plugin's first pass). Freeze first.
+FREEZE_STILL_JS = """() => {
+  const style = document.createElement('style');
+  style.setAttribute('data-page-scraper', 'freeze');
+  style.textContent = `
+    html.page-scraper-freeze, html.page-scraper-freeze * {
+      animation: none !important;
+      animation-delay: 0s !important;
+      animation-play-state: paused !important;
+      transition: none !important;
+      scroll-behavior: auto !important;
+    }
+  `;
+  document.documentElement.classList.add('page-scraper-freeze');
+  document.head.appendChild(style);
+  for (const v of document.querySelectorAll('video')) {
+    try { v.pause(); } catch (e) {}
+  }
+  document.querySelectorAll('.animated, [data-aos], .elementor-invisible, .skrollable').forEach((el) => {
+    el.classList.add('revealed', 'aos-animate');
+    el.classList.remove('elementor-invisible');
+    el.style.setProperty('opacity', '1', 'important');
+    el.style.setProperty('transform', 'none', 'important');
+    el.style.setProperty('visibility', 'visible', 'important');
+  });
+  const vh = window.innerHeight || 900;
+  for (const el of document.querySelectorAll('*')) {
+    let pos;
+    try { pos = getComputedStyle(el).position; } catch (e) { continue; }
+    if (pos !== 'fixed' && pos !== 'sticky') continue;
+    const r = el.getBoundingClientRect();
+    if (r.height < vh * 2.5) continue;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'header' || tag === 'nav') continue;
+    if (el.querySelector('header, nav, video')) continue;
+    el.style.setProperty('display', 'none', 'important');
+  }
+  return true;
+}"""
+
 _NAV_LOSS = (
     "execution context was destroyed",
     "because of a navigation",
@@ -184,6 +249,57 @@ def existing_output(path: Path | None) -> str | None:
     except OSError:
         return None
     return None
+
+
+def _exc_text(exc: BaseException) -> str:
+    text = str(exc).strip()
+    return text or type(exc).__name__
+
+
+def jpeg_size(data: bytes) -> tuple[int, int] | None:
+    """Width, height from a JPEG SOF marker."""
+    if len(data) < 10 or data[:2] != b"\xff\xd8":
+        return None
+    i = 2
+    end = len(data)
+    while i + 8 < end:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in {0xC0, 0xC1, 0xC2}:
+            height = int.from_bytes(data[i + 5 : i + 7], "big")
+            width = int.from_bytes(data[i + 7 : i + 9], "big")
+            if width > 0 and height > 0:
+                return width, height
+            return None
+        if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        seglen = int.from_bytes(data[i + 2 : i + 4], "big")
+        if seglen < 2:
+            return None
+        i += 2 + seglen
+    return None
+
+
+def ffmpeg_scale_filter(frames: list[bytes]) -> str:
+    """Constant-size pad so image2pipe does not abort when a frame grows."""
+    max_w = max_h = 0
+    for jpeg in frames:
+        size = jpeg_size(jpeg)
+        if not size:
+            continue
+        max_w = max(max_w, size[0])
+        max_h = max(max_h, size[1])
+    if max_w < 2 or max_h < 2:
+        return "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    width = max_w + (max_w % 2)
+    height = max_h + (max_h % 2)
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    )
 
 
 def is_oom_error(error: str | None) -> bool:
@@ -553,6 +669,10 @@ class BrowserEngine:
             await try_cookies()
             await scroll_page(page)
             await try_cookies()
+            try:
+                await eval_page(page, YOUTUBE_POSTERS_JS)
+            except Exception:
+                log.exception("could not replace YouTube embeds for %s", url)
 
             directory = url_output_dir(output_root, url)
             if options.get("preset") and options["preset"] != "desktop":
@@ -601,10 +721,13 @@ class BrowserEngine:
 
             result_video = None
             playback_fps = float(video_fps)
+            video_note: str | None = None
             if record_video and jpeg_frames:
                 playback_fps = _playback_fps(len(jpeg_frames), t_first, t_last, video_fps)
                 try:
-                    ffmpeg = await _start_ffmpeg_pipe(video_path, playback_fps)
+                    ffmpeg = await _start_ffmpeg_pipe(
+                        video_path, playback_fps, vf=ffmpeg_scale_filter(jpeg_frames)
+                    )
                     assert ffmpeg.stdin is not None
                     for jpeg in jpeg_frames:
                         ffmpeg.stdin.write(jpeg)
@@ -615,12 +738,14 @@ class BrowserEngine:
                         result_video = str(video_path)
                     else:
                         video_path.unlink(missing_ok=True)
-                except Exception:
+                        video_note = "video encode failed"
+                except Exception as exc:
                     log.exception("could not encode video for %s", url)
                     if ffmpeg is not None:
                         await _finish_ffmpeg_pipe(ffmpeg, ignore_errors=True)
                         ffmpeg = None
                     video_path.unlink(missing_ok=True)
+                    video_note = f"video encode failed: {_exc_text(exc)[-300:]}"
 
             # Banners can appear during encode (WDS waits on window.load + 500ms).
             await try_cookies()
@@ -628,9 +753,15 @@ class BrowserEngine:
             height = 0
             height_capped = False
             notes: list[str] = []
+            if video_note:
+                notes.append(video_note)
             try:
                 height = int(await eval_page(page, HEIGHT_JS) or 0)
                 height_capped = height > max_height
+                try:
+                    await eval_page(page, FREEZE_STILL_JS)
+                except Exception:
+                    log.exception("could not freeze page for still %s", url)
                 try:
                     still_capped = await asyncio.wait_for(
                         _screenshot(page, screenshot_path, height, max_height),
@@ -638,7 +769,7 @@ class BrowserEngine:
                     )
                 except Exception as exc:
                     still_capped = True
-                    notes.append(f"still screenshot timed out: {exc}")
+                    notes.append(f"still screenshot timed out: {_exc_text(exc)}")
                 height_capped = bool(height_capped or still_capped)
                 try:
                     outer = await eval_page(
@@ -682,7 +813,7 @@ class BrowserEngine:
 
             if not stable:
                 notes.append("page did not stay stable; captured anyway")
-            if record_video and not result_video:
+            if record_video and not result_video and not video_note:
                 notes.append("video encode failed")
             if not result_shot:
                 notes.append("PNG was not written")
@@ -858,16 +989,21 @@ async def _screenshot(page: Page, path: Path, page_height: int, max_height: int)
         "path": str(path),
         "type": "png",
         "full_page": True,
-        "animations": "disabled",
         "caret": "hide",
         "scale": "css",
     }
     capped = page_height > max_height
-    try:
-        await screenshot_page(page, **kwargs)
-        return capped
-    except Exception:
-        pass
+    # Freeze CSS already paused motion; `disabled` can hang on Duda/video pages.
+    for animations in ("allow", "disabled"):
+        try:
+            await asyncio.wait_for(
+                screenshot_page(page, **kwargs, animations=animations),
+                timeout=12,
+            )
+            return capped
+        except Exception:
+            continue
+    kwargs["animations"] = "allow"
     kwargs["full_page"] = True
     limits = [max_height] if capped else [None]
     limits.extend(cap for cap in (16_384, 8_192, 4_096) if cap < (page_height or max_height))
@@ -879,7 +1015,7 @@ async def _screenshot(page: Page, path: Path, page_height: int, max_height: int)
         try:
             if limit is not None:
                 await _clamp_document_height(page, limit)
-            await screenshot_page(page, **kwargs)
+            await asyncio.wait_for(screenshot_page(page, **kwargs), timeout=8)
             return bool(capped or limit)
         except Exception:
             continue
@@ -899,7 +1035,7 @@ def _playback_fps(
     return n_frames / duration
 
 
-async def _start_ffmpeg_pipe(dest: Path, fps: float):
+async def _start_ffmpeg_pipe(dest: Path, fps: float, vf: str | None = None):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is not installed")
@@ -926,7 +1062,7 @@ async def _start_ffmpeg_pipe(dest: Path, fps: float):
         "-pix_fmt",
         "yuv420p",
         "-vf",
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        vf or "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-movflags",
         "+faststart",
         str(dest),

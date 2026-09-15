@@ -44,6 +44,7 @@ class JobCreate(BaseModel):
     cookies: list[CookieIn] = Field(default_factory=list)
     stable_ms: int | None = None
     timeout_ms: int | None = None
+    settle_s: int | None = None
     video_seconds: int | None = None
     max_height_px: int | None = None
     dismiss_cookies: bool | None = None
@@ -130,6 +131,7 @@ async def get_config(
         "max_height_px": settings.max_height_px,
         "stable_ms": settings.stable_ms,
         "timeout_ms": settings.timeout_ms,
+        "settle_s": settings.settle_s,
         "concurrency": settings.concurrency,
         "output_root": str(settings.output_root),
         "presets": known_presets(),
@@ -186,6 +188,7 @@ async def create_job(
         "cookies": [c.model_dump(exclude_none=True) for c in body.cookies],
         "stable_ms": body.stable_ms or settings.stable_ms,
         "timeout_ms": body.timeout_ms or settings.timeout_ms,
+        "settle_s": body.settle_s or settings.settle_s,
         "video_seconds": body.video_seconds or settings.video_seconds,
         "max_height_px": body.max_height_px or settings.max_height_px,
         "dismiss_cookies": settings.dismiss_cookies

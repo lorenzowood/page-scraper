@@ -15,7 +15,8 @@ services:
       MAX_HEIGHT_PX: ${MAX_HEIGHT_PX:-50000}
       STABLE_MS: ${STABLE_MS:-5000}
       TIMEOUT_MS: ${TIMEOUT_MS:-30000}
-      VIDEO: ${VIDEO:-true}
+      SETTLE_S: ${SETTLE_S:-3}
+      VIDEO: ${VIDEO:-false}
       VIDEO_FPS: ${VIDEO_FPS:-5}
       VIDEO_SECONDS: ${VIDEO_SECONDS:-30}
       API_TOKEN: ${API_TOKEN:-}

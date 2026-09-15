@@ -325,7 +325,7 @@ form.addEventListener("submit", async (event) => {
     user_agent: data.get("user_agent") || null,
     cookies,
   };
-  for (const key of ["viewport_width", "viewport_height", "stable_ms", "timeout_ms", "video_seconds"]) {
+  for (const key of ["viewport_width", "viewport_height", "settle_s", "timeout_ms"]) {
     const value = data.get(key);
     if (value) payload[key] = Number(value);
   }

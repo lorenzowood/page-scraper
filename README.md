@@ -1,6 +1,6 @@
 # Page Scraper
 
-Local service that takes a URL (or a batch) and writes a **full-page PNG**, the **live serialized DOM**, and an optional **viewport video** once the page has gone quiet. The CLI talks to a REST API. The Web UI is a qBittorrent-style job list: queued, running, finished, progress, ETA.
+Local service that takes a URL (or a batch) and writes a **full-page PNG** and the **live serialized DOM**. The CLI talks to a REST API. The Web UI is a qBittorrent-style job list: queued, running, finished, progress, ETA.
 
 It is a **page** scraper, not a site crawler. Chromium (via Playwright) is the engine. Brave is not used; it is a common source of hung headless sessions.
 
@@ -12,18 +12,15 @@ Defaults:
 
 - Desktop Chromium, **1440×900 window**, PNG of the **full scrollable page** (`scale=css`, so 1× pixels). The window height stays 1440×900 so `100vh` heroes layout as they do on a desktop; the screenshot still includes everything below the fold. Do not stretch Chromium’s real viewport to the document height — the compositor paints black. Pages taller than about 4,500px (Divi one-pagers, Squarespace, Framer) are **stitched from viewport tiles** because Chromium’s `full_page` screenshot often hangs. Sticky headers are unfixed first so they do not reprint on every slice.
 - DOM as `document.documentElement.outerHTML` after JS has run
-- Wait until the DOM signature is unchanged for **5s**, give up after **30s**
-- Cookie banners: hide known overlays first (so “Allow all” handlers that reload the page do not interrupt the capture), then click visible Accept/Allow/Reject-style buttons (and known CMP selectors). Retry after scroll, every **5s** while waiting, and again immediately before the still PNG. Leftover bars with no clickable Accept (GOV.UK `#global-cookie-message`, WDS `.cookie-policy`) are hidden.
-- Viewport **H.264** sampled at up to **5 fps** for **30s** (`VIDEO_SECONDS`, x264 `qp 0`). Playback uses the wall-clock span of those frames, so it runs in real time even when a screenshot is slower than 5 fps. Frames are padded to a constant size so ffmpeg does not abort when the page grows mid-clip. The window stays 1440×900. Short pages use a full-document JPEG per frame; taller pages use the visible viewport so Chromium does not spend the watchdog budget on 10k-px bitmaps. Use VLC or mpv; Finder/QuickTime often show a black frame on this encode. If the page goes quiet first, the clip ends there.
+- Load, dismiss cookies, scroll to load lazy content, dismiss again, wait **3s** (`SETTLE_S`), then take one still. No “wait until the page goes quiet” loop and no viewport video — looping heroes and Framer canvases never go quiet, and filming them blew the watchdog.
+- Cookie banners: hide known overlays first (so “Allow all” handlers that reload the page do not interrupt the capture), then click visible Accept/Allow/Reject-style buttons (and known CMP selectors). Retry after scroll, during a long settle, and again immediately before the still PNG. Leftover bars with no clickable Accept (GOV.UK `#global-cookie-message`, WDS `.cookie-policy`) are hidden.
 - YouTube iframes cannot play in headless Chromium; they are replaced with the public poster image before capture.
-- The DOM-quiet check uses node counts and image load state, not `innerHTML.length` (Squarespace documents can be several megabytes and that serialisation stalls the wait loop).
 - Before the still PNG, motion is frozen (CSS animations off, videos paused, oversized `position:fixed` SEO layers hidden) so a full-page stitch does not capture Duda/Elementor slide-ins the way a first-pass browser plugin does.
 - Height cap **50,000px** (Chromium may refuse huge bitmaps; the worker falls back to 16384 / 8192)
 
 Failure policy:
 
 - Page does not load (navigation error, HTTP 4xx/5xx, empty document): **no files**, item marked `failed` / `load`
-- Page loads but never goes quiet (ticking clock, live widgets, carousel): **keep PNG + DOM + video**, item marked `complete` with reason `unstable`
 - PNG is missing (Chromium OOM, screenshot timeout, encoder killed): **do not link a 404**; item marked `failed` / `oom` or `screenshot`, with `error` set. `Retry errors` will pick these up.
 
 Layout matches `examples/`:
@@ -31,7 +28,6 @@ Layout matches `examples/`:
 ```
 {output}/{host}/: /screenshot 2026-08-22 00-10-00.png
 {output}/{host}/: /dom 2026-08-22 00-10-00.html
-{output}/{host}/: /video 2026-08-22 00-10-00.mp4
 {output}/{host}/: /meta.json
 ```
 
@@ -175,7 +171,7 @@ docker compose exec page-scraper page-scraper add --wait https://example.com/
 
 `--output` is a folder under the NAS root, not an arbitrary host path.
 
-`get` downloads each item’s PNG, HTML, MP4, and `meta.json` through the API. `rm --files` deletes that job’s capture files (not the whole NAS root), then `meta.json` and empty host folders.
+`get` downloads each item’s PNG, HTML, and `meta.json` through the API (and an MP4 if an older capture wrote one). `rm --files` deletes that job’s capture files (not the whole NAS root), then `meta.json` and empty host folders.
 
 ## API
 
@@ -188,9 +184,8 @@ docker compose exec page-scraper page-scraper add --wait https://example.com/
   "output_dir": "client-a",
   "cookies": [{"name": "session", "value": "…"}],
   "user_agent": null,
-  "stable_ms": 5000,
-  "timeout_ms": 30000,
-  "video_seconds": 30
+  "settle_s": 3,
+  "timeout_ms": 30000
 }
 ```
 
@@ -210,4 +205,4 @@ Presets: `desktop`, `iphone`, `no-css`, `no-js`. Job-level cookies / UA / viewpo
 
 ## Why not ArchiveBox / Browserless / shot-scraper
 
-Those cover pieces (PNG, DOM dump, or a browser pool). None of them is a small queued “PNG + stable DOM + variants + ETA + NAS inbox” service. This repo is that thin layer on Playwright’s official Python image, which is the shortcut that actually stays up for thousands of unrelated homepages.
+Those cover pieces (PNG, DOM dump, or a browser pool). None of them is a small queued “PNG + DOM + variants + ETA + NAS inbox” service. This repo is that thin layer on Playwright’s official Python image, which is the shortcut that actually stays up for thousands of unrelated homepages.

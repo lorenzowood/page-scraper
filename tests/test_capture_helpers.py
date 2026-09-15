@@ -3,7 +3,6 @@ import pytest
 from pagecapture.capture import (
     CaptureResult,
     _is_nav_loss,
-    _playback_fps,
     apply_memory_failure,
     eval_page,
     existing_output,
@@ -51,13 +50,6 @@ def test_continue_after_goto_timeout_if_document_exists():
     assert should_continue_after_goto_error(exc, "https://example.com/") is True
     assert should_continue_after_goto_error(exc, "chrome-error://chromewebdata/") is False
     assert should_continue_after_goto_error(RuntimeError("net::ERR_NAME_NOT_RESOLVED"), "https://x/") is False
-
-
-def test_playback_fps_uses_wall_clock_span():
-    assert _playback_fps(1, 0.0, 1.0, 5) == 5.0
-    assert _playback_fps(6, 100.0, 101.0, 5) == pytest.approx(5.0)
-    # first-to-last 4s, n/(n-1) correction → 3 / (4 * 3/2) = 0.5
-    assert _playback_fps(3, 10.0, 14.0, 5) == pytest.approx(0.5)
 
 
 class _FlakyPage:
@@ -156,15 +148,6 @@ def test_jpeg_size_reads_sof0():
     assert jpeg_size(b"not a jpeg") is None
 
 
-def test_ffmpeg_scale_filter_pads_to_max_even_size():
-    from pagecapture.capture import ffmpeg_scale_filter
-
-    frames = [_sof0_jpeg(1440, 5200), _sof0_jpeg(1450, 5532)]
-    vf = ffmpeg_scale_filter(frames)
-    assert "pad=1450:5532" in vf
-    assert ffmpeg_scale_filter([]) == "scale=trunc(iw/2)*2:trunc(ih/2)*2"
-
-
 async def test_png_from_jpeg_rejects_empty(tmp_path):
     from pagecapture.capture import png_from_jpeg
 
@@ -189,8 +172,14 @@ def test_vstack_filter_scales_then_stacks():
     assert "[s0][s1][s2]vstack=inputs=3" in vf
 
 
-def test_signature_js_does_not_serialize_inner_html():
-    from pagecapture.capture import SIGNATURE_JS
+async def test_wait_settle_skips_when_zero():
+    from pagecapture.capture import wait_settle
 
-    assert "innerHTML" not in SIGNATURE_JS
-    assert "getElementsByTagName" in SIGNATURE_JS
+    called = 0
+
+    async def periodic():
+        nonlocal called
+        called += 1
+
+    await wait_settle(settle_s=0, on_periodic=periodic)
+    assert called == 0

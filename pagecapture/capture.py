@@ -38,7 +38,7 @@ HIDE_WEBDRIVER_JS = """
 """
 
 # Below-the-fold carousels often pause until they intersect the window.
-# Force them to start so full-page frames actually show motion.
+# Force them to start so lazy content actually loads during the scroll pass.
 FORCE_IN_VIEW_JS = """
 (() => {
   const Native = window.IntersectionObserver;
@@ -84,25 +84,6 @@ FORCE_IN_VIEW_JS = """
   };
 })();
 """
-
-SIGNATURE_JS = """() => {
-  const root = document.documentElement;
-  const body = document.body;
-  const images = Array.from(document.images || []);
-  const loaded = images.filter((img) => img.complete).length;
-  const height = Math.max(
-    root ? root.scrollHeight : 0,
-    body ? body.scrollHeight : 0,
-    0
-  );
-  return [
-    height,
-    root ? root.childElementCount : 0,
-    document.getElementsByTagName('*').length,
-    loaded,
-    images.length
-  ].join(":");
-}"""
 
 HEIGHT_JS = """() => Math.max(
   document.documentElement ? document.documentElement.scrollHeight : 0,
@@ -311,25 +292,6 @@ def jpeg_size(data: bytes) -> tuple[int, int] | None:
             return None
         i += 2 + seglen
     return None
-
-
-def ffmpeg_scale_filter(frames: list[bytes]) -> str:
-    """Constant-size pad so image2pipe does not abort when a frame grows."""
-    max_w = max_h = 0
-    for jpeg in frames:
-        size = jpeg_size(jpeg)
-        if not size:
-            continue
-        max_w = max(max_w, size[0])
-        max_h = max(max_h, size[1])
-    if max_w < 2 or max_h < 2:
-        return "scale=trunc(iw/2)*2:trunc(ih/2)*2"
-    width = max_w + (max_w % 2)
-    height = max_h + (max_h % 2)
-    return (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-    )
 
 
 async def png_from_jpeg(jpeg: bytes, dest: Path) -> bool:
@@ -648,10 +610,8 @@ class BrowserEngine:
     ) -> CaptureResult:
         started = asyncio.get_event_loop().time()
         timeout_ms = int(options.get("timeout_ms", self.settings.timeout_ms))
-        extra = 0
-        if bool(options.get("video", self.settings.video)):
-            extra = int(options.get("video_seconds", self.settings.video_seconds)) + 30
-        budget = (timeout_ms / 1000) * 2 + 40 + extra
+        settle_s = int(options.get("settle_s", self.settings.settle_s))
+        budget = (timeout_ms / 1000) + settle_s + 80
         result = CaptureResult(status="failed", reason="crash")
         for attempt in range(2):
             oom_before = read_cgroup_oom_kills()
@@ -700,7 +660,7 @@ class BrowserEngine:
         javascript = bool(options.get("javascript", True))
         css = bool(options.get("css", True))
         timeout_ms = int(options.get("timeout_ms", self.settings.timeout_ms))
-        stable_ms = int(options.get("stable_ms", self.settings.stable_ms))
+        settle_s = int(options.get("settle_s", self.settings.settle_s))
         max_height = int(options.get("max_height_px", self.settings.max_height_px))
         user_agent = options.get("user_agent")
         cookies = options.get("cookies") or []
@@ -710,9 +670,6 @@ class BrowserEngine:
 
         window_w = int(viewport["width"])
         window_h = int(viewport["height"])
-        record_video = bool(options.get("video", self.settings.video))
-        video_fps = int(options.get("video_fps", self.settings.video_fps))
-        video_seconds = int(options.get("video_seconds", self.settings.video_seconds))
 
         if not user_agent:
             user_agent = chrome_desktop_ua(self._require_browser().version)
@@ -736,7 +693,6 @@ class BrowserEngine:
             await context.add_init_script(FORCE_IN_VIEW_JS)
 
         page: Page | None = None
-        ffmpeg = None
         result = CaptureResult(status="failed", reason="crash")
         try:
             if cookies:
@@ -859,91 +815,15 @@ class BrowserEngine:
             stamp = timestamp_label(datetime.now())
             screenshot_path = unique_path(directory, f"screenshot {stamp}", ".png")
             dom_path = unique_path(directory, f"dom {stamp}", ".html")
-            video_path = unique_path(directory, f"video {stamp}", ".mp4")
-            clock = asyncio.get_event_loop()
-            jpeg_frames: list[bytes] = []
-            max_frames = max(video_fps, 1) * max(video_seconds, 1)
-            t_first: float | None = None
-            t_last: float | None = None
-            page_h = 0
-            try:
-                page_h = int(await eval_page(page, HEIGHT_JS) or 0)
-            except Exception:
-                pass
-
-            async def grab_frame() -> None:
-                nonlocal t_first, t_last
-                if len(jpeg_frames) >= max_frames:
-                    return
-                full_page = page_h <= FULLPAGE_SHOT_MAX_PX
-                shot_kwargs: dict[str, Any] = {
-                    "type": "jpeg",
-                    "quality": 80,
-                    "full_page": full_page,
-                    "animations": "allow",
-                    "caret": "hide",
-                    "scale": "css",
-                    "timeout": 8_000,
-                }
-                try:
-                    jpeg = await screenshot_page(page, **shot_kwargs)
-                except Exception:
-                    if not full_page:
-                        raise
-                    shot_kwargs["full_page"] = False
-                    jpeg = await screenshot_page(page, **shot_kwargs)
-                now = clock.time()
-                if t_first is None:
-                    t_first = now
-                t_last = now
-                jpeg_frames.append(jpeg)
-
-            stable = await wait_until_stable(
-                page,
-                stable_ms=stable_ms,
-                timeout_ms=timeout_ms,
-                on_tick=grab_frame if record_video else None,
-                interval=1.0 / max(video_fps, 1),
+            await wait_settle(
+                settle_s=settle_s,
                 on_periodic=try_cookies if dismiss else None,
-                periodic_s=5.0,
             )
-
-            result_video = None
-            playback_fps = float(video_fps)
-            video_note: str | None = None
-            if record_video and jpeg_frames:
-                playback_fps = _playback_fps(len(jpeg_frames), t_first, t_last, video_fps)
-                try:
-                    ffmpeg = await _start_ffmpeg_pipe(
-                        video_path, playback_fps, vf=ffmpeg_scale_filter(jpeg_frames)
-                    )
-                    assert ffmpeg.stdin is not None
-                    for jpeg in jpeg_frames:
-                        ffmpeg.stdin.write(jpeg)
-                        await asyncio.wait_for(ffmpeg.stdin.drain(), timeout=5)
-                    video_ok = await _finish_ffmpeg_pipe(ffmpeg)
-                    ffmpeg = None
-                    if video_ok:
-                        result_video = str(video_path)
-                    else:
-                        video_path.unlink(missing_ok=True)
-                        video_note = "video encode failed"
-                except Exception as exc:
-                    log.exception("could not encode video for %s", url)
-                    if ffmpeg is not None:
-                        await _finish_ffmpeg_pipe(ffmpeg, ignore_errors=True)
-                        ffmpeg = None
-                    video_path.unlink(missing_ok=True)
-                    video_note = f"video encode failed: {_exc_text(exc)[-300:]}"
-
-            # Banners can appear during encode (WDS waits on window.load + 500ms).
             await try_cookies()
 
             height = 0
             height_capped = False
             notes: list[str] = []
-            if video_note:
-                notes.append(video_note)
             try:
                 height = int(await eval_page(page, HEIGHT_JS) or 0)
                 height_capped = height > max_height
@@ -978,8 +858,6 @@ class BrowserEngine:
                         )
                     except Exception as exc:
                         notes.append(f"JPEG still failed: {_exc_text(exc)}")
-                    if jpeg_still is None and jpeg_frames:
-                        jpeg_still = jpeg_frames[-1]
                     if jpeg_still and await png_from_jpeg(jpeg_still, screenshot_path):
                         notes.append("PNG written from JPEG frame")
                 if not existing_output(screenshot_path):
@@ -993,10 +871,6 @@ class BrowserEngine:
                         notes.append(f"viewport stitch failed: {_exc_text(exc)}")
                     if stitched and existing_output(screenshot_path):
                         notes.append("PNG stitched from viewport tiles")
-                    elif not existing_output(screenshot_path) and jpeg_frames:
-                        if await png_from_jpeg(jpeg_frames[-1], screenshot_path):
-                            notes.append("PNG written from JPEG frame")
-                            still_capped = True
                 height_capped = bool(height_capped or still_capped)
                 try:
                     outer = await eval_page(
@@ -1011,7 +885,6 @@ class BrowserEngine:
 
             result_shot = existing_output(screenshot_path)
             result_dom = existing_output(dom_path)
-            result_video = existing_output(Path(result_video)) if result_video else None
 
             viewport_now = None
             try:
@@ -1022,7 +895,6 @@ class BrowserEngine:
                 "url": url,
                 "preset": options.get("preset"),
                 "http_status": http_status,
-                "stable": stable,
                 "height_px": height,
                 "height_capped": height_capped,
                 "cookie_dismissed": cookie_dismissed,
@@ -1030,25 +902,16 @@ class BrowserEngine:
                 "css": css,
                 "viewport": {"width": window_w, "height": window_h},
                 "capture_viewport": viewport_now,
-                "video_fps": round(playback_fps, 4) if result_video else None,
-                "video": Path(result_video).name if result_video else None,
+                "settle_s": settle_s,
             }
             try:
                 (directory / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
             except OSError:
                 notes.append("meta.json not saved")
 
-            if not stable:
-                notes.append("page did not stay stable; captured anyway")
-            if record_video and not result_video and not video_note:
-                notes.append("video encode failed")
             if not result_shot:
                 notes.append("PNG was not written")
-            problems = [
-                note
-                for note in notes
-                if note != "page did not stay stable; captured anyway"
-            ]
+            problems = list(notes)
             if not result_shot:
                 result = CaptureResult(
                     status="failed",
@@ -1057,7 +920,7 @@ class BrowserEngine:
                     error="; ".join(problems) or "PNG was not written",
                     screenshot_path=None,
                     dom_path=result_dom,
-                    video_path=result_video,
+                    video_path=None,
                     output_path=str(directory),
                     http_status=http_status,
                     height_px=height,
@@ -1068,12 +931,12 @@ class BrowserEngine:
             else:
                 result = CaptureResult(
                     status="complete",
-                    reason=None if stable else "unstable",
+                    reason=None,
                     saved=True,
                     error="; ".join(problems) if problems else None,
                     screenshot_path=result_shot,
                     dom_path=result_dom,
-                    video_path=result_video,
+                    video_path=None,
                     output_path=str(directory),
                     http_status=http_status,
                     height_px=height,
@@ -1083,8 +946,6 @@ class BrowserEngine:
                 )
             return result
         finally:
-            if ffmpeg is not None:
-                await _finish_ffmpeg_pipe(ffmpeg, ignore_errors=True)
             if page is not None:
                 try:
                     await asyncio.wait_for(page.close(), timeout=5)
@@ -1141,57 +1002,30 @@ async def scroll_page(page: Page, *, budget_s: float = 12) -> None:
     await page.wait_for_timeout(150)
 
 
-async def wait_until_stable(
-    page: Page,
+async def wait_settle(
     *,
-    stable_ms: int,
-    timeout_ms: int,
-    on_tick=None,
-    interval: float = 0.2,
+    settle_s: float,
     on_periodic=None,
     periodic_s: float = 5.0,
-) -> bool:
+) -> None:
+    """Pause after scroll/dismiss so late banners and fonts can appear."""
+    delay = max(float(settle_s), 0.0)
+    if delay <= 0:
+        return
     loop = asyncio.get_event_loop()
-    deadline = loop.time() + (timeout_ms / 1000)
-    last = None
-    changed_at = loop.time()
+    deadline = loop.time() + delay
     last_periodic = loop.time()
-    while loop.time() < deadline:
-        tick = loop.time()
-        if on_periodic is not None and (tick - last_periodic) >= periodic_s:
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        if on_periodic is not None and (loop.time() - last_periodic) >= periodic_s:
             try:
                 await on_periodic()
             except Exception:
                 log.exception("periodic cookie dismiss failed")
             last_periodic = loop.time()
-        if on_tick is not None:
-            try:
-                await on_tick()
-            except Exception:
-                log.exception("video frame capture failed")
-                on_tick = None
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            break
-        try:
-            signature = await asyncio.wait_for(
-                eval_page(page, SIGNATURE_JS), timeout=min(4.0, remaining)
-            )
-        except Exception as exc:
-            if _is_nav_loss(exc):
-                await _settle(page)
-            await asyncio.sleep(min(interval, max(0.0, deadline - loop.time())))
-            continue
-        now = loop.time()
-        if signature != last:
-            last = signature
-            changed_at = now
-        elif (now - changed_at) * 1000 >= stable_ms:
-            return True
-        leftover = interval - (loop.time() - tick)
-        if leftover > 0:
-            await asyncio.sleep(min(leftover, max(0.0, deadline - loop.time())))
-    return False
+        await asyncio.sleep(min(0.25, remaining))
 
 
 async def _clamp_document_height(page: Page, height: int) -> None:
@@ -1243,77 +1077,3 @@ async def _screenshot(page: Page, path: Path, page_height: int, max_height: int)
         except Exception:
             continue
     return True
-
-
-def _playback_fps(
-    n_frames: int, t_first: float | None, t_last: float | None, sample_fps: int
-) -> float:
-    """Constant fps so n frames occupy the wall-clock span they were taken over."""
-    sample = float(max(sample_fps, 1))
-    if n_frames <= 1 or t_first is None or t_last is None or t_last <= t_first:
-        return sample
-    duration = (t_last - t_first) * n_frames / (n_frames - 1)
-    if duration <= 0:
-        return sample
-    return n_frames / duration
-
-
-async def _start_ffmpeg_pipe(dest: Path, fps: float, vf: str | None = None):
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError("ffmpeg is not installed")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    rate = max(fps, 0.01)
-    return await asyncio.create_subprocess_exec(
-        ffmpeg,
-        "-y",
-        "-f",
-        "image2pipe",
-        "-framerate",
-        f"{rate:.6f}",
-        "-vcodec",
-        "mjpeg",
-        "-i",
-        "pipe:0",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-qp",
-        "0",
-        "-preset",
-        "ultrafast",
-        "-pix_fmt",
-        "yuv420p",
-        "-vf",
-        vf or "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        "-movflags",
-        "+faststart",
-        str(dest),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-
-async def _finish_ffmpeg_pipe(proc, ignore_errors: bool = False) -> bool:
-    try:
-        if proc.stdin:
-            proc.stdin.close()
-        try:
-            _, err = await asyncio.wait_for(proc.communicate(), timeout=90)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            if ignore_errors:
-                return False
-            raise RuntimeError("ffmpeg timed out")
-        if proc.returncode != 0:
-            if ignore_errors:
-                return False
-            detail = (err or b"").decode("utf-8", errors="replace")[-800:]
-            raise RuntimeError(detail or f"ffmpeg exited {proc.returncode}")
-        return True
-    except Exception:
-        if ignore_errors:
-            return False
-        raise

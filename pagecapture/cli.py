@@ -47,9 +47,8 @@ def main(argv: list[str] | None = None) -> None:
     add.add_argument("--no-js", action="store_true")
     add.add_argument("--no-css", action="store_true")
     add.add_argument("--cookie", action="append", default=[], help="name=value")
-    add.add_argument("--stable-ms", type=int)
+    add.add_argument("--settle-s", type=int, help="Pause after scroll before the PNG (default 3)")
     add.add_argument("--timeout-ms", type=int)
-    add.add_argument("--video-seconds", type=int)
     add.add_argument("--wait", action="store_true", help="Block until the job finishes")
     add.set_defaults(func=cmd_add)
 
@@ -144,9 +143,8 @@ def cmd_add(args: argparse.Namespace) -> None:
         "javascript": False if args.no_js else None,
         "css": False if args.no_css else None,
         "cookies": cookies,
-        "stable_ms": args.stable_ms,
+        "settle_s": args.settle_s,
         "timeout_ms": args.timeout_ms,
-        "video_seconds": args.video_seconds,
     }
     payload = {key: value for key, value in payload.items() if value not in (None, [])}
     with _client(args) as client:

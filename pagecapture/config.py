@@ -19,8 +19,9 @@ class Settings(BaseSettings):
     max_height_px: int = 50_000
     stable_ms: int = 5_000
     timeout_ms: int = 30_000
+    settle_s: int = 3
     dismiss_cookies: bool = True
-    video: bool = True
+    video: bool = False
     video_fps: int = 5
     video_seconds: int = 30
     on_complete_hook: str = ""

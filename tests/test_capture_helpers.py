@@ -169,3 +169,28 @@ async def test_png_from_jpeg_rejects_empty(tmp_path):
     from pagecapture.capture import png_from_jpeg
 
     assert await png_from_jpeg(b"", tmp_path / "x.png") is False
+
+
+def test_viewport_tile_offsets_cover_document():
+    from pagecapture.capture import viewport_tile_offsets
+
+    assert viewport_tile_offsets(0, 900) == [0]
+    assert viewport_tile_offsets(900, 900) == [0]
+    assert viewport_tile_offsets(10428, 900) == list(range(0, 10428, 900))
+    assert viewport_tile_offsets(80_000, 900, max_tiles=60) == list(range(0, 80_000, 900))[:60]
+
+
+def test_vstack_filter_scales_then_stacks():
+    from pagecapture.capture import vstack_filter
+
+    assert vstack_filter(1, 1441) == "scale=1442:-2"
+    vf = vstack_filter(3, 1440)
+    assert "[0:v]scale=1440:-2[s0];" in vf
+    assert "[s0][s1][s2]vstack=inputs=3" in vf
+
+
+def test_signature_js_does_not_serialize_inner_html():
+    from pagecapture.capture import SIGNATURE_JS
+
+    assert "innerHTML" not in SIGNATURE_JS
+    assert "getElementsByTagName" in SIGNATURE_JS

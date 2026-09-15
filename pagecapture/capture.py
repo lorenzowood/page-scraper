@@ -18,6 +18,10 @@ from .presets import chrome_desktop_ua
 
 log = logging.getLogger("page-scraper.capture")
 
+# Chromium full_page screenshots of builder landing pages (Divi/Squarespace/Framer)
+# often hang. Above this, stills are stitched from viewport tiles instead.
+FULLPAGE_SHOT_MAX_PX = 4_500
+
 LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
@@ -94,7 +98,7 @@ SIGNATURE_JS = """() => {
   return [
     height,
     root ? root.childElementCount : 0,
-    (root && root.innerHTML ? root.innerHTML.length : 0),
+    document.getElementsByTagName('*').length,
     loaded,
     images.length
   ].join(":");
@@ -154,6 +158,24 @@ HIDE_HUGE_FIXED_JS = """() => {
     n += 1;
   }
   return n;
+}"""
+
+# So a viewport-tile stitch does not reprint the header on every slice.
+UNFIX_JS = """() => {
+  const sx = window.scrollX || 0;
+  const sy = window.scrollY || 0;
+  for (const el of document.querySelectorAll('*')) {
+    let s;
+    try { s = getComputedStyle(el); } catch (e) { continue; }
+    if (s.position !== 'fixed' && s.position !== 'sticky') continue;
+    const r = el.getBoundingClientRect();
+    el.style.setProperty('position', 'absolute', 'important');
+    el.style.setProperty('top', (sy + r.top) + 'px', 'important');
+    el.style.setProperty('left', (sx + r.left) + 'px', 'important');
+    el.style.setProperty('bottom', 'auto', 'important');
+    el.style.setProperty('right', 'auto', 'important');
+  }
+  return true;
 }"""
 
 # Full-page screenshots scroll internally; Duda/Elementor then slide things in
@@ -343,6 +365,117 @@ async def png_from_jpeg(jpeg: bytes, dest: Path) -> bool:
     return True
 
 
+def viewport_tile_offsets(total: int, inner_h: int, max_tiles: int = 60) -> list[int]:
+    """Scroll Y for each viewport-height slice of a tall document."""
+    inner_h = max(int(inner_h), 1)
+    total = max(int(total), 0)
+    if total <= 0:
+        return [0]
+    return list(range(0, total, inner_h))[:max_tiles]
+
+
+def vstack_filter(n: int, width: int) -> str:
+    """Scale every tile to a shared even width, then stack them."""
+    width = max(int(width), 2)
+    width += width % 2
+    if n <= 1:
+        return f"scale={width}:-2"
+    scaled = "".join(f"[{i}:v]scale={width}:-2[s{i}];" for i in range(n))
+    stacked = "".join(f"[s{i}]" for i in range(n))
+    return f"{scaled}{stacked}vstack=inputs={n}"
+
+
+async def png_from_vstack(tiles: list[bytes], dest: Path) -> bool:
+    """Join viewport JPEG tiles into one PNG."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not tiles:
+        return False
+    if len(tiles) == 1:
+        return await png_from_jpeg(tiles[0], dest)
+    size = jpeg_size(tiles[0])
+    width = size[0] if size else 1440
+    tmp = dest.parent / f".tiles-{dest.stem}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        paths: list[Path] = []
+        for i, jpeg in enumerate(tiles):
+            path = tmp / f"{i:03d}.jpg"
+            path.write_bytes(jpeg)
+            paths.append(path)
+        args: list[str] = [ffmpeg, "-y"]
+        for path in paths:
+            args.extend(["-i", str(path)])
+        args.extend(["-filter_complex", vstack_filter(len(paths), width), str(dest)])
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=40)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            dest.unlink(missing_ok=True)
+            return False
+        if proc.returncode != 0 or not existing_output(dest):
+            dest.unlink(missing_ok=True)
+            return False
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def stitch_viewport_png(page: Page, dest: Path, max_height: int) -> bool:
+    """Capture the document as viewport JPEGs and stack them. Avoids Chromium full_page hangs."""
+    try:
+        inner_h = int(await eval_page(page, "() => window.innerHeight") or 900)
+        inner_w = int(await eval_page(page, "() => window.innerWidth") or 1440)
+        total = min(int(await eval_page(page, HEIGHT_JS) or 0), max_height)
+    except Exception:
+        return False
+    inner_h = max(inner_h, 1)
+    inner_w = max(inner_w, 1)
+    if total <= 0:
+        return False
+    try:
+        await eval_page(page, "() => window.scrollTo(0, 0)")
+        await eval_page(page, UNFIX_JS)
+    except Exception:
+        log.exception("could not unfix sticky layers before stitch")
+    tiles: list[bytes] = []
+    for y in viewport_tile_offsets(total, inner_h):
+        remaining = min(inner_h, max(total - y, 1))
+        try:
+            await eval_page(page, "(t) => window.scrollTo(0, t)", y)
+            await asyncio.sleep(0.04)
+            kwargs: dict[str, Any] = {
+                "type": "jpeg",
+                "quality": 85,
+                "full_page": False,
+                "animations": "allow",
+                "caret": "hide",
+                "scale": "css",
+                "timeout": 8_000,
+            }
+            if remaining < inner_h:
+                kwargs["clip"] = {
+                    "x": 0,
+                    "y": 0,
+                    "width": inner_w,
+                    "height": remaining,
+                }
+            tiles.append(await screenshot_page(page, **kwargs))
+        except Exception:
+            log.exception("viewport tile failed at y=%s", y)
+            break
+    try:
+        await eval_page(page, "() => window.scrollTo(0, 0)")
+    except Exception:
+        pass
+    return await png_from_vstack(tiles, dest)
+
+
 def is_oom_error(error: str | None) -> bool:
     text = (error or "").lower()
     return any(marker in text for marker in _OOM_MARKERS)
@@ -417,6 +550,7 @@ async def eval_page(page: Page, expression: str, *args, retries: int = 4):
 
 async def screenshot_page(page: Page, **kwargs):
     last: Exception | None = None
+    kwargs.setdefault("timeout", 15_000)
     for _ in range(4):
         try:
             return await page.screenshot(**kwargs)
@@ -731,23 +865,33 @@ class BrowserEngine:
             max_frames = max(video_fps, 1) * max(video_seconds, 1)
             t_first: float | None = None
             t_last: float | None = None
+            page_h = 0
+            try:
+                page_h = int(await eval_page(page, HEIGHT_JS) or 0)
+            except Exception:
+                pass
 
             async def grab_frame() -> None:
                 nonlocal t_first, t_last
                 if len(jpeg_frames) >= max_frames:
                     return
-                jpeg = await asyncio.wait_for(
-                    screenshot_page(
-                        page,
-                        type="jpeg",
-                        quality=80,
-                        full_page=True,
-                        animations="allow",
-                        caret="hide",
-                        scale="css",
-                    ),
-                    timeout=20,
-                )
+                full_page = page_h <= FULLPAGE_SHOT_MAX_PX
+                shot_kwargs: dict[str, Any] = {
+                    "type": "jpeg",
+                    "quality": 80,
+                    "full_page": full_page,
+                    "animations": "allow",
+                    "caret": "hide",
+                    "scale": "css",
+                    "timeout": 8_000,
+                }
+                try:
+                    jpeg = await screenshot_page(page, **shot_kwargs)
+                except Exception:
+                    if not full_page:
+                        raise
+                    shot_kwargs["full_page"] = False
+                    jpeg = await screenshot_page(page, **shot_kwargs)
                 now = clock.time()
                 if t_first is None:
                     t_first = now
@@ -808,28 +952,29 @@ class BrowserEngine:
                     await eval_page(page, HIDE_HUGE_FIXED_JS)
                 except Exception:
                     log.exception("could not freeze page for still %s", url)
-                try:
-                    still_capped = await asyncio.wait_for(
-                        _screenshot(page, screenshot_path, height, max_height),
-                        timeout=35,
-                    )
-                except Exception as exc:
-                    still_capped = True
-                    notes.append(f"still screenshot timed out: {_exc_text(exc)}")
-                if not existing_output(screenshot_path):
+                still_capped = height_capped
+                use_fullpage = height <= FULLPAGE_SHOT_MAX_PX
+                if use_fullpage:
+                    try:
+                        still_capped = await asyncio.wait_for(
+                            _screenshot(page, screenshot_path, height, max_height),
+                            timeout=25,
+                        )
+                    except Exception as exc:
+                        still_capped = True
+                        notes.append(f"still screenshot timed out: {_exc_text(exc)}")
+                if not existing_output(screenshot_path) and use_fullpage:
                     jpeg_still: bytes | None = None
                     try:
-                        jpeg_still = await asyncio.wait_for(
-                            screenshot_page(
-                                page,
-                                type="jpeg",
-                                quality=85,
-                                full_page=True,
-                                animations="allow",
-                                caret="hide",
-                                scale="css",
-                            ),
-                            timeout=20,
+                        jpeg_still = await screenshot_page(
+                            page,
+                            type="jpeg",
+                            quality=85,
+                            full_page=True,
+                            animations="allow",
+                            caret="hide",
+                            scale="css",
+                            timeout=8_000,
                         )
                     except Exception as exc:
                         notes.append(f"JPEG still failed: {_exc_text(exc)}")
@@ -837,7 +982,21 @@ class BrowserEngine:
                         jpeg_still = jpeg_frames[-1]
                     if jpeg_still and await png_from_jpeg(jpeg_still, screenshot_path):
                         notes.append("PNG written from JPEG frame")
-                        still_capped = bool(still_capped)
+                if not existing_output(screenshot_path):
+                    try:
+                        stitched = await asyncio.wait_for(
+                            stitch_viewport_png(page, screenshot_path, max_height),
+                            timeout=50,
+                        )
+                    except Exception as exc:
+                        stitched = False
+                        notes.append(f"viewport stitch failed: {_exc_text(exc)}")
+                    if stitched and existing_output(screenshot_path):
+                        notes.append("PNG stitched from viewport tiles")
+                    elif not existing_output(screenshot_path) and jpeg_frames:
+                        if await png_from_jpeg(jpeg_frames[-1], screenshot_path):
+                            notes.append("PNG written from JPEG frame")
+                            still_capped = True
                 height_capped = bool(height_capped or still_capped)
                 try:
                     outer = await eval_page(
@@ -1060,6 +1219,7 @@ async def _screenshot(page: Page, path: Path, page_height: int, max_height: int)
         "animations": "allow",
         "caret": "hide",
         "scale": "css",
+        "timeout": 20_000,
     }
     capped = page_height > max_height
     try:

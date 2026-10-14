@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path("/data")
     output_root: Path = Path("/output")
     api_token: str = ""
+    db_connect_timeout_s: float = 30.0
 
     concurrency: int = 1
     recycle_every: int = 25

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -93,8 +95,20 @@ async def lifespan(_: FastAPI):
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    settings.ensure_dirs()
-    await db.connect()
+    try:
+        settings.ensure_dirs()
+        await asyncio.wait_for(db.connect(), timeout=settings.db_connect_timeout_s)
+    except Exception as exc:
+        # A hung or failing DB open (often a network share that is not up yet)
+        # must kill the process so Docker's restart policy can retry; a stuck
+        # aiosqlite thread would otherwise keep a half-started server alive.
+        logging.getLogger(__name__).error(
+            "database not usable at %s (%s: %s); exiting",
+            settings.data_dir,
+            type(exc).__name__,
+            exc,
+        )
+        os._exit(1)
     await worker.start()
     yield
     await worker.stop()

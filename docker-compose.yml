@@ -19,6 +19,7 @@ services:
       VIDEO: ${VIDEO:-false}
       VIDEO_FPS: ${VIDEO_FPS:-5}
       VIDEO_SECONDS: ${VIDEO_SECONDS:-30}
+      DB_CONNECT_TIMEOUT_S: ${DB_CONNECT_TIMEOUT_S:-30}
       API_TOKEN: ${API_TOKEN:-}
       ON_COMPLETE_HOOK: ${ON_COMPLETE_HOOK:-}
     volumes:
